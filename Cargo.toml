@@ -98,6 +98,14 @@ tree-sitter-typescript = "0.23"
 
 [patch.crates-io]
 v8 = { path = "vendor/v8" }
+# Local patch (2026-05-28) — harden Code Mode's `execute_typescript` tool
+# description so Haiku-4.5 stops writing `import { Streamgen } from
+# 'streamgen'` (which fails with TS2792). Streamgen HTML widgets render
+# blank without this fix. See TASKS.md P5-46 + commit comments for the
+# upstream PR plan. Identical to crates.io 0.3.0 EXCEPT the description
+# text file in descriptions/tools/execute_typescript_catalog/v1.txt
+# (and minor consequential edits if needed).
+pctx_code_mode = { path = "vendor/pctx_code_mode" }
 cudaforge = { git = "https://github.com/jbg/cudaforge", rev = "e7c1967340e40673db98dc9e17da0f04834a456f" }
 # TODO: switch to released version in opentelemetry 0.32.0
 # https://github.com/open-telemetry/opentelemetry-rust/issues/3408

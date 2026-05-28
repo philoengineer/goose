@@ -7161,8 +7161,6 @@ dependencies = [
 [[package]]
 name = "pctx_code_mode"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d9f5ffc774d0c440e780aaa2593fbf5c5710e5b5c63a6b498116d3f46a09fe0"
 dependencies = [
  "futures",
  "pctx_codegen",
