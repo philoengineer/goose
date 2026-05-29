@@ -193,6 +193,8 @@ fn format_messages(messages: &[Message], image_format: &ImageFormat) -> Vec<Data
                 MessageContent::Image(image) => {
                     content_array.push(convert_image(image, image_format));
                 }
+                // P5-18: documents only routed to Anthropic; compile-safety.
+                MessageContent::Document(_) => {}
                 MessageContent::FrontendToolRequest(req) => {
                     let text = match &req.tool_call {
                         Ok(tool_call) => format!(

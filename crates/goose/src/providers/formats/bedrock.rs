@@ -55,6 +55,10 @@ pub fn to_bedrock_message_content(content: &MessageContent) -> Result<bedrock::C
         MessageContent::Image(image) => {
             bedrock::ContentBlock::Image(to_bedrock_image(&image.data, &image.mime_type)?)
         }
+        // P5-18: documents only routed to Anthropic by the frontend; on
+        // other providers they arrive as extracted text, so this is a
+        // compile-safety fallback.
+        MessageContent::Document(_) => bedrock::ContentBlock::Text(String::new()),
         MessageContent::Thinking(thinking) => {
             let mut builder = bedrock::ReasoningTextBlock::builder().text(&thinking.thinking);
             if !thinking.signature.is_empty() {

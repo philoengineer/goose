@@ -206,6 +206,18 @@ pub fn format_messages(messages: &[Message]) -> Vec<Value> {
                 MessageContent::Image(image) => {
                     content.push(convert_image(image, &ImageFormat::Anthropic));
                 }
+                MessageContent::Document(doc) => {
+                    // Native Anthropic document block (P5-18). PDFs read
+                    // natively — charts, scans, layout — not just text.
+                    content.push(json!({
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": doc.mime_type,
+                            "data": doc.data,
+                        }
+                    }));
+                }
                 MessageContent::FrontendToolRequest(tool_request) => {
                     if let Ok(tool_call) = &tool_request.tool_call {
                         content.push(json!({

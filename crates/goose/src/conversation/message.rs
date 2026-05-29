@@ -257,12 +257,27 @@ pub struct SystemNotificationContent {
     pub data: Option<serde_json::Value>,
 }
 
+/// Document content (P5-18, Fabrica). A non-image file attachment
+/// (PDF today) carried as base64 so providers that support native
+/// document understanding (e.g. Anthropic's `document` block) can read
+/// the original — charts, scans, layout — rather than only extracted
+/// text. Mirrors RawImageContent's shape; rmcp has no document type so
+/// this is goose-local. Serializes camelCase to match the frontend
+/// wire shape `{ type: "document", data, mimeType }`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentContent {
+    pub data: String,
+    pub mime_type: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 /// Content passed inside a message, which can be both simple content and tool content
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum MessageContent {
     Text(TextContent),
     Image(ImageContent),
+    Document(DocumentContent),
     ToolRequest(ToolRequest),
     ToolResponse(ToolResponse),
     ToolConfirmationRequest(ToolConfirmationRequest),
@@ -278,6 +293,7 @@ impl fmt::Display for MessageContent {
         match self {
             MessageContent::Text(t) => write!(f, "{}", t.text),
             MessageContent::Image(i) => write!(f, "[Image: {}]", i.mime_type),
+            MessageContent::Document(d) => write!(f, "[Document: {}]", d.mime_type),
             MessageContent::ToolRequest(r) => {
                 write!(f, "[ToolRequest: {}]", r.to_readable_string())
             }
@@ -391,6 +407,13 @@ impl MessageContent {
             }
             .no_annotation(),
         )
+    }
+
+    pub fn document<S: Into<String>, T: Into<String>>(data: S, mime_type: T) -> Self {
+        MessageContent::Document(DocumentContent {
+            data: data.into(),
+            mime_type: mime_type.into(),
+        })
     }
 
     pub fn tool_request<S: Into<String>>(
@@ -1045,6 +1068,36 @@ mod tests {
         let malicious = "Hello\u{E0041}\u{E0042}\u{E0043}world"; // Invisible "ABC"
         let message = Message::user().with_text(malicious);
         assert_eq!(message.as_concat_text(), "Helloworld");
+    }
+
+    #[test]
+    fn test_p518_document_deserialize_and_anthropic_block() {
+        // The exact wire shape the Fabrica frontend sends (P5-18).
+        let json = serde_json::json!({
+            "type": "document",
+            "data": "QkFTRTY0UERG",
+            "mimeType": "application/pdf"
+        });
+        let mc: MessageContent = serde_json::from_value(json).expect("deserialize Document");
+        match &mc {
+            MessageContent::Document(d) => {
+                assert_eq!(d.mime_type, "application/pdf");
+                assert_eq!(d.data, "QkFTRTY0UERG");
+            }
+            other => panic!("expected Document variant, got {:?}", other),
+        }
+
+        // The Anthropic formatter must emit a native document block.
+        let msg = Message::user().with_content(mc).with_text("summarize this");
+        let formatted = crate::providers::formats::anthropic::format_messages(&[msg]);
+        let content = formatted[0]["content"].as_array().expect("content array");
+        let doc_block = content
+            .iter()
+            .find(|b| b["type"] == "document")
+            .expect("a document content block");
+        assert_eq!(doc_block["source"]["type"], "base64");
+        assert_eq!(doc_block["source"]["media_type"], "application/pdf");
+        assert_eq!(doc_block["source"]["data"], "QkFTRTY0UERG");
     }
 
     #[test]

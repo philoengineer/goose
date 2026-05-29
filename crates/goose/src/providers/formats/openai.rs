@@ -289,6 +289,10 @@ pub fn format_messages(messages: &[Message], image_format: &ImageFormat) -> Vec<
                         }));
                     }
                 }
+                // P5-18: documents only routed to Anthropic by the
+                // frontend; non-Anthropic providers receive extracted
+                // text instead, so this never fires in practice.
+                MessageContent::Document(_) => {}
                 MessageContent::FrontendToolRequest(request) => match &request.tool_call {
                     Ok(tool_call) => {
                         let sanitized_name = sanitize_function_name(&tool_call.name);
