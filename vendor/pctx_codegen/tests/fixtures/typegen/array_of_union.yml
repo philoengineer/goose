@@ -1,0 +1,66 @@
+schema:
+  type: object
+  properties:
+    image_urls:
+      description: array whose items are a union (regression for missing parens in `item[]`)
+      type: array
+      items:
+        oneOf:
+          - type: string
+          - type: object
+            required:
+              - url
+            properties:
+              url:
+                type: string
+              alt:
+                type: string
+    nullable_items:
+      description: array whose items are a nullable primitive (string | null)
+      type: array
+      items:
+        type:
+          - string
+          - "null"
+
+tests:
+  valid:
+    - id: array-of-strings
+      value:
+        image_urls:
+          - https://example.com/a.jpg
+          - https://example.com/b.jpg
+    - id: array-of-objects
+      value:
+        image_urls:
+          - url: https://example.com/a.jpg
+            alt: a picture
+    - id: array-mixed
+      value:
+        image_urls:
+          - https://example.com/a.jpg
+          - url: https://example.com/b.jpg
+    - id: array-empty
+      value:
+        image_urls: []
+    - id: nullable-items-mixed
+      value:
+        nullable_items:
+          - foo
+          - null
+  invalid:
+    - id: bare-string
+      value:
+        image_urls: https://example.com/a.jpg
+    - id: array-of-numbers
+      value:
+        image_urls:
+          - 123
+    - id: object-missing-url
+      value:
+        image_urls:
+          - alt: no url here
+    - id: nullable-items-number
+      value:
+        nullable_items:
+          - 42

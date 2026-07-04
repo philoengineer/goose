@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "f80514b0057cbba2015fc059e08e98b9252eacbf"
+  },
+  "path_in_vcs": "crates/pctx_codegen"
+}

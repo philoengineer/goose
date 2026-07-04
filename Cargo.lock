@@ -7179,8 +7179,6 @@ dependencies = [
 [[package]]
 name = "pctx_codegen"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b05191d9a37d1101f3a78e770e1a2b5521e75ce718f1165fb15ac16025d297b"
 dependencies = [
  "biome_formatter",
  "biome_js_formatter",
@@ -7189,11 +7187,15 @@ dependencies = [
  "handlebars",
  "heck",
  "indexmap 2.14.0",
+ "insta",
+ "pctx_type_check_runtime",
  "regex",
  "schemars 0.8.22",
  "serde",
  "serde_json",
+ "serde_yaml",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "unicode-ident",
 ]

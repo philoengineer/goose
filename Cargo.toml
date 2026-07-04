@@ -3,6 +3,9 @@ members = [
     "crates/*",
     # Mainly for cargo-machete to not error out during inspection.
     "vendor/v8",
+    # Member (not just patch path) so its dev-dependency tests run:
+    # `cargo test -p pctx_codegen --test typegen`.
+    "vendor/pctx_codegen",
 ]
 exclude = ["ui/goose2/src-tauri"]
 resolver = "2"
@@ -106,6 +109,13 @@ v8 = { path = "vendor/v8" }
 # text file in descriptions/tools/execute_typescript_catalog/v1.txt
 # (and minor consequential edits if needed).
 pctx_code_mode = { path = "vendor/pctx_code_mode" }
+# Local patch (2026-06-09) — fix execute_typescript codegen for arrays of
+# unions: `oneOf` array items rendered as `string | Obj1[]` (parses as
+# `string | (Obj1[])`), so agents passing `["url", ...]` hit TS2322 and
+# burn retries. Identical to crates.io 0.3.0 EXCEPT parenthesizing union
+# item signatures in src/schema_type.rs (+ regression test). See TASKS.md
+# P3-3c live-verify finding 2.
+pctx_codegen = { path = "vendor/pctx_codegen" }
 cudaforge = { git = "https://github.com/jbg/cudaforge", rev = "e7c1967340e40673db98dc9e17da0f04834a456f" }
 # TODO: switch to released version in opentelemetry 0.32.0
 # https://github.com/open-telemetry/opentelemetry-rust/issues/3408

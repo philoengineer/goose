@@ -1,0 +1,20 @@
+---
+source: vendor/pctx_codegen/tests/typegen.rs
+expression: "&typegen_res.types"
+---
+export type ArrayOfUnion = {
+  /**
+   * array whose items are a union (regression for missing parens in `item[]`)
+   */
+  image_urls?: (string | ArrayOfUnionImageUrlsObj1)[] | undefined;
+  /**
+   * array whose items are a nullable primitive (string | null)
+   */
+  nullable_items?: (string | null)[] | undefined;
+};
+
+export type ArrayOfUnionImageUrlsObj1 = {
+  url: string;
+
+  alt?: string | undefined;
+};
