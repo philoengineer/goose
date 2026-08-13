@@ -67,6 +67,38 @@ impl OpenRouterProvider {
             name: OPENROUTER_PROVIDER_NAME.to_string(),
         })
     }
+
+    /// Build a provider authenticated with an explicitly supplied API key
+    /// (per-run member credential) instead of the stored `OPENROUTER_API_KEY`
+    /// secret. Mirrors `from_env` minus the secret lookup, so it works even
+    /// when no process-wide key is configured. The key is only held in the
+    /// constructed client and is never persisted.
+    pub fn from_key(model: ModelConfig, api_key: String) -> Result<Self> {
+        if api_key.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "Explicit OpenRouter API key must not be empty"
+            ));
+        }
+
+        let model = model.with_fast(OPENROUTER_DEFAULT_FAST_MODEL, OPENROUTER_PROVIDER_NAME)?;
+
+        let config = crate::config::Config::global();
+        let host: String = config
+            .get_param("OPENROUTER_HOST")
+            .unwrap_or_else(|_| "https://openrouter.ai".to_string());
+
+        let auth = AuthMethod::BearerToken(api_key);
+        let api_client = ApiClient::new(host, auth)?
+            .with_header("HTTP-Referer", "https://goose-docs.ai")?
+            .with_header("X-Title", "goose")?;
+
+        Ok(Self {
+            api_client,
+            model,
+            supports_streaming: true,
+            name: OPENROUTER_PROVIDER_NAME.to_string(),
+        })
+    }
 }
 
 /// Update the request when using anthropic model.
@@ -300,5 +332,37 @@ impl Provider for OpenRouterProvider {
             })?;
 
         stream_openai_compat(response, log)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_key_builds_provider_with_supplied_key() {
+        let provider = OpenRouterProvider::from_key(
+            ModelConfig::new_or_fail("anthropic/claude-test"),
+            "member-supplied-key".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(provider.name, OPENROUTER_PROVIDER_NAME);
+        match provider.api_client.auth() {
+            AuthMethod::BearerToken(key) => assert_eq!(key, "member-supplied-key"),
+            _ => panic!("expected AuthMethod::BearerToken carrying the supplied key"),
+        }
+    }
+
+    #[test]
+    fn from_key_rejects_empty_key() {
+        let err = match OpenRouterProvider::from_key(
+            ModelConfig::new_or_fail("anthropic/claude-test"),
+            String::new(),
+        ) {
+            Ok(_) => panic!("empty explicit key must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("must not be empty"));
     }
 }

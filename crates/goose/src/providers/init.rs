@@ -167,6 +167,29 @@ pub async fn create(
     entry.create(model, extensions).await
 }
 
+/// Build a provider authenticated with an explicitly supplied API key
+/// (per-run member credential) instead of the process-wide config/env secret.
+///
+/// Only providers with a clean explicit-key construction path are supported.
+/// Anything else is an error: callers must NOT fall back to `create` (env
+/// credentials) when an explicit key was supplied, otherwise a request made
+/// on behalf of one credential would silently run on another.
+pub async fn create_with_explicit_key(
+    name: &str,
+    model: ModelConfig,
+    api_key: String,
+) -> Result<Arc<dyn Provider>> {
+    match name {
+        "anthropic" => Ok(Arc::new(AnthropicProvider::from_key(model, api_key)?)),
+        "openai" => Ok(Arc::new(OpenAiProvider::from_key(model, api_key).await?)),
+        "openrouter" => Ok(Arc::new(OpenRouterProvider::from_key(model, api_key)?)),
+        other => Err(anyhow::anyhow!(
+            "Provider '{}' does not support per-run API keys (supported: anthropic, openai, openrouter)",
+            other
+        )),
+    }
+}
+
 pub async fn create_with_working_dir(
     name: &str,
     model: ModelConfig,
@@ -217,6 +240,26 @@ mod tests {
     use super::*;
     use crate::config::paths::Paths;
     use std::fs;
+
+    #[tokio::test]
+    async fn create_with_explicit_key_rejects_unsupported_provider() {
+        let err = match create_with_explicit_key(
+            "ollama",
+            ModelConfig::new_or_fail("some-model"),
+            "member-key".to_string(),
+        )
+        .await
+        {
+            Ok(_) => {
+                panic!("providers without explicit-key support must be rejected, not env-fallback")
+            }
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("does not support per-run API keys"),
+            "unexpected error: {err}"
+        );
+    }
 
     #[tokio::test]
     async fn test_tanzu_declarative_provider_registry_wiring() {

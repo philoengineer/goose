@@ -280,6 +280,24 @@ impl OpenAiProvider {
         })
     }
 
+    /// Build a provider authenticated with an explicitly supplied API key
+    /// (per-run member credential) instead of the stored `OPENAI_API_KEY`
+    /// secret. Reuses `from_env` for endpoint/header resolution — which never
+    /// fails on a missing key (it falls back to `NoAuth`) — then swaps in the
+    /// supplied bearer token. The key is only held in the constructed client
+    /// and is never persisted.
+    pub async fn from_key(model: ModelConfig, api_key: String) -> Result<Self> {
+        if api_key.trim().is_empty() {
+            return Err(anyhow::anyhow!("Explicit OpenAI API key must not be empty"));
+        }
+
+        let mut provider = Self::from_env(model).await?;
+        provider.api_client = provider
+            .api_client
+            .with_auth(AuthMethod::BearerToken(api_key));
+        Ok(provider)
+    }
+
     #[doc(hidden)]
     pub fn new(api_client: ApiClient, model: ModelConfig) -> Self {
         Self {

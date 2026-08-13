@@ -2361,6 +2361,21 @@ impl Agent {
     /// This is used when resuming a session to restore the provider state
     /// Returns true if the session's provider was replaced with a fallback.
     pub async fn restore_provider_from_session(&self, session: &Session) -> Result<bool> {
+        // Fail closed for externally-credentialed sessions: their provider was
+        // built from an explicitly supplied per-run key that is deliberately
+        // never persisted, so it cannot be reconstructed from env/config here.
+        // Silently rebuilding via `from_env` would run the session on the
+        // process-wide key — the exact leak this flag exists to prevent. The
+        // caller must re-supply the credential via /agent/update_provider.
+        if session.external_credential {
+            return Err(anyhow!(
+                "Session {} requires an external credential: its provider was built \
+                 from a per-run API key that is never persisted. Re-supply the key via \
+                 /agent/update_provider instead of falling back to environment credentials.",
+                session.id
+            ));
+        }
+
         let config = Config::global();
 
         let provider_name = session
@@ -2842,6 +2857,28 @@ mod tests {
                 .push((request_id.to_string(), confirmation.clone()));
             request_id == "known"
         }
+    }
+
+    #[tokio::test]
+    async fn restore_provider_fails_closed_for_external_credential_sessions() {
+        let agent = Agent::new();
+        let session = Session {
+            id: "external-cred-session".to_string(),
+            provider_name: Some("anthropic".to_string()),
+            external_credential: true,
+            ..Default::default()
+        };
+
+        let err = agent
+            .restore_provider_from_session(&session)
+            .await
+            .expect_err("restore must fail closed for externally-credentialed sessions");
+        assert!(
+            err.to_string().contains("external credential"),
+            "unexpected error: {err}"
+        );
+        // No env-based provider may be constructed as a fallback.
+        assert!(agent.provider.lock().await.is_none());
     }
 
     #[tokio::test]

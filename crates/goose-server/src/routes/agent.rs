@@ -50,6 +50,12 @@ pub struct UpdateProviderRequest {
     session_id: String,
     context_limit: Option<usize>,
     request_params: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Per-run member credential. When set, the provider is constructed with
+    /// this key instead of the process-wide env/config secret, and the session
+    /// is marked `external_credential` so restores fail closed. The key itself
+    /// is NEVER persisted — callers must re-supply it on each update_provider.
+    #[serde(default)]
+    api_key: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -606,12 +612,54 @@ async fn update_agent_provider(
         EnabledExtensionsState::for_session(state.session_manager(), &payload.session_id, config)
             .await;
 
-    let new_provider = create(&payload.provider, model_config, extensions)
+    // With an explicit per-run key the provider MUST be built from that key;
+    // an unsupported provider is a hard 400, never a silent from_env fallback.
+    let external_credential = payload.api_key.is_some();
+    let new_provider = match payload.api_key {
+        Some(api_key) => {
+            if api_key.trim().is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "api_key must not be empty when provided".to_owned(),
+                ));
+            }
+            goose::providers::create_with_explicit_key(&payload.provider, model_config, api_key)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "Failed to create {} provider with explicit api_key: {}",
+                            &payload.provider, e
+                        ),
+                    )
+                })?
+        }
+        None => create(&payload.provider, model_config, extensions)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to create {} provider: {}", &payload.provider, e),
+                )
+            })?,
+    };
+
+    // Record (only) whether the session runs on an external per-run credential
+    // so provider restoration fails closed instead of reaching for env keys.
+    // The key itself is never written anywhere. Persisted BEFORE the provider
+    // swap: if we crash in between, an externally-credentialed session is
+    // already marked (fail closed) rather than left restorable from env keys.
+    state
+        .session_manager()
+        .update(&payload.session_id)
+        .external_credential(external_credential)
+        .apply()
         .await
         .map_err(|e| {
             (
-                StatusCode::BAD_REQUEST,
-                format!("Failed to create {} provider: {}", &payload.provider, e),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to persist credential marker: {}", e),
             )
         })?;
 
@@ -1292,6 +1340,26 @@ mod tests {
     use goose::session::session_manager::SessionType;
     use rmcp::model::Tool;
     use rmcp::object;
+
+    #[test]
+    fn update_provider_request_deserializes_without_api_key() {
+        let req: UpdateProviderRequest = serde_json::from_str(
+            r#"{"provider":"anthropic","model":"claude-test","session_id":"s1"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.provider, "anthropic");
+        assert_eq!(req.session_id, "s1");
+        assert!(req.api_key.is_none());
+    }
+
+    #[test]
+    fn update_provider_request_deserializes_with_api_key() {
+        let req: UpdateProviderRequest = serde_json::from_str(
+            r#"{"provider":"anthropic","model":"claude-test","session_id":"s1","api_key":"sk-member-123"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.api_key.as_deref(), Some("sk-member-123"));
+    }
 
     fn frontend_extension() -> ExtensionConfig {
         ExtensionConfig::Frontend {

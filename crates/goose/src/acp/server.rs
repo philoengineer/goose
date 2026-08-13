@@ -4473,6 +4473,7 @@ print(\"hello, world\")
             goose_mode: GooseMode::default(),
             archived_at: None,
             project_id: None,
+            external_credential: false,
         }
     }
 

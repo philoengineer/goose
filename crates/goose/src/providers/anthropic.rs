@@ -94,6 +94,45 @@ impl AnthropicProvider {
         })
     }
 
+    /// Build a provider authenticated with an explicitly supplied API key
+    /// (per-run member credential) instead of the stored `ANTHROPIC_API_KEY`
+    /// secret. Mirrors `from_env` minus the secret lookup, so it works even
+    /// when no process-wide key is configured. The key is only held in the
+    /// constructed client and is never persisted.
+    pub fn from_key(model: ModelConfig, api_key: String) -> Result<Self> {
+        if api_key.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "Explicit Anthropic API key must not be empty"
+            ));
+        }
+
+        let model = model.with_fast(ANTHROPIC_DEFAULT_FAST_MODEL, ANTHROPIC_PROVIDER_NAME)?;
+
+        let config = crate::config::Config::global();
+        let host: String = config
+            .get_param("ANTHROPIC_HOST")
+            .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+
+        let auth = AuthMethod::ApiKey {
+            header_name: "x-api-key".to_string(),
+            key: api_key,
+        };
+
+        let api_client =
+            ApiClient::new(host, auth)?.with_header("anthropic-version", ANTHROPIC_API_VERSION)?;
+
+        Ok(Self {
+            api_client,
+            model,
+            supports_streaming: true,
+            name: ANTHROPIC_PROVIDER_NAME.to_string(),
+            custom_models: None,
+            dynamic_models: None,
+            skip_canonical_filtering: false,
+            format_options: AnthropicFormatOptions::default(),
+        })
+    }
+
     pub fn from_custom_config(
         model: ModelConfig,
         config: DeclarativeProviderConfig,
@@ -444,6 +483,36 @@ mod tests {
             fast_model: None,
             preserves_thinking: false,
         }
+    }
+
+    #[test]
+    fn from_key_builds_provider_with_supplied_key() {
+        let provider = AnthropicProvider::from_key(
+            ModelConfig::new_or_fail("claude-test"),
+            "member-supplied-key".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(provider.name, ANTHROPIC_PROVIDER_NAME);
+        match provider.api_client.auth() {
+            AuthMethod::ApiKey { header_name, key } => {
+                assert_eq!(header_name, "x-api-key");
+                assert_eq!(key, "member-supplied-key");
+            }
+            _ => panic!("expected AuthMethod::ApiKey carrying the supplied key"),
+        }
+    }
+
+    #[test]
+    fn from_key_rejects_empty_key() {
+        let err = match AnthropicProvider::from_key(
+            ModelConfig::new_or_fail("claude-test"),
+            "   ".to_string(),
+        ) {
+            Ok(_) => panic!("empty explicit key must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("must not be empty"));
     }
 
     #[tokio::test]
