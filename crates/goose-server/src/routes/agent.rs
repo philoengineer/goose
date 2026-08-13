@@ -56,6 +56,12 @@ pub struct UpdateProviderRequest {
     /// is NEVER persisted — callers must re-supply it on each update_provider.
     #[serde(default)]
     api_key: Option<String>,
+    /// Per-run OpenAI-compatible endpoint host (e.g. a member's own Venice
+    /// base URL). Only honored for `provider == "openai"` alongside `api_key`;
+    /// points the client at this host instead of the process-global OpenAI
+    /// endpoint. Never persisted.
+    #[serde(default)]
+    api_host: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -615,6 +621,7 @@ async fn update_agent_provider(
     // With an explicit per-run key the provider MUST be built from that key;
     // an unsupported provider is a hard 400, never a silent from_env fallback.
     let external_credential = payload.api_key.is_some();
+    let api_host = payload.api_host;
     let new_provider = match payload.api_key {
         Some(api_key) => {
             if api_key.trim().is_empty() {
@@ -623,17 +630,22 @@ async fn update_agent_provider(
                     "api_key must not be empty when provided".to_owned(),
                 ));
             }
-            goose::providers::create_with_explicit_key(&payload.provider, model_config, api_key)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!(
-                            "Failed to create {} provider with explicit api_key: {}",
-                            &payload.provider, e
-                        ),
-                    )
-                })?
+            goose::providers::create_with_explicit_key(
+                &payload.provider,
+                model_config,
+                api_key,
+                api_host,
+            )
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Failed to create {} provider with explicit api_key: {}",
+                        &payload.provider, e
+                    ),
+                )
+            })?
         }
         None => create(&payload.provider, model_config, extensions)
             .await
@@ -1359,6 +1371,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(req.api_key.as_deref(), Some("sk-member-123"));
+        assert!(req.api_host.is_none());
+    }
+
+    #[test]
+    fn update_provider_request_deserializes_with_api_host() {
+        let req: UpdateProviderRequest = serde_json::from_str(
+            r#"{"provider":"openai","model":"gpt-4o","session_id":"s1","api_key":"venice-key","api_host":"https://api.venice.ai/api/v1"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.api_key.as_deref(), Some("venice-key"));
+        assert_eq!(req.api_host.as_deref(), Some("https://api.venice.ai/api/v1"));
     }
 
     fn frontend_extension() -> ExtensionConfig {

@@ -384,6 +384,12 @@ impl ApiClient {
         &self.auth
     }
 
+    /// Read access to the configured host (crate-internal; used by tests).
+    #[cfg(test)]
+    pub(crate) fn host(&self) -> &str {
+        &self.host
+    }
+
     pub fn with_query(mut self, params: Vec<(String, String)>) -> Self {
         self.default_query = params;
         self

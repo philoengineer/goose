@@ -170,6 +170,11 @@ pub async fn create(
 /// Build a provider authenticated with an explicitly supplied API key
 /// (per-run member credential) instead of the process-wide config/env secret.
 ///
+/// `api_host`, when set, points an OpenAI-compatible provider at the member's
+/// own endpoint (e.g. Venice) instead of the process-global OpenAI host — used
+/// so a member's own key/endpoint runs in a shared container without picking up
+/// the box's OpenAI settings.
+///
 /// Only providers with a clean explicit-key construction path are supported.
 /// Anything else is an error: callers must NOT fall back to `create` (env
 /// credentials) when an explicit key was supplied, otherwise a request made
@@ -178,10 +183,16 @@ pub async fn create_with_explicit_key(
     name: &str,
     model: ModelConfig,
     api_key: String,
+    api_host: Option<String>,
 ) -> Result<Arc<dyn Provider>> {
     match name {
         "anthropic" => Ok(Arc::new(AnthropicProvider::from_key(model, api_key)?)),
-        "openai" => Ok(Arc::new(OpenAiProvider::from_key(model, api_key).await?)),
+        "openai" => match api_host {
+            Some(host) => Ok(Arc::new(OpenAiProvider::from_key_with_host(
+                model, api_key, host,
+            )?)),
+            None => Ok(Arc::new(OpenAiProvider::from_key(model, api_key).await?)),
+        },
         "openrouter" => Ok(Arc::new(OpenRouterProvider::from_key(model, api_key)?)),
         other => Err(anyhow::anyhow!(
             "Provider '{}' does not support per-run API keys (supported: anthropic, openai, openrouter)",
@@ -247,6 +258,7 @@ mod tests {
             "ollama",
             ModelConfig::new_or_fail("some-model"),
             "member-key".to_string(),
+            None,
         )
         .await
         {
@@ -259,6 +271,22 @@ mod tests {
             err.to_string().contains("does not support per-run API keys"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn create_with_explicit_key_openai_uses_supplied_host() {
+        let provider = match create_with_explicit_key(
+            "openai",
+            ModelConfig::new_or_fail("gpt-4o"),
+            "member-venice-key".to_string(),
+            Some("https://api.venice.ai/api/v1".to_string()),
+        )
+        .await
+        {
+            Ok(provider) => provider,
+            Err(err) => panic!("openai + api_host should build: {err}"),
+        };
+        assert_eq!(provider.get_name(), "openai");
     }
 
     #[tokio::test]
