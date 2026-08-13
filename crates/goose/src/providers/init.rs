@@ -201,6 +201,45 @@ pub async fn create_with_explicit_key(
     }
 }
 
+/// Build a provider authenticated with an explicitly supplied OAuth access
+/// token (a member's Claude subscription or ChatGPT Codex credential) instead
+/// of a global on-disk token or the process-wide env secret — the per-session
+/// OAuth-native sibling of [`create_with_explicit_key`].
+///
+/// Each such provider carries the member's token in an isolated transport: the
+/// Claude subscription token rides a fresh `claude` CLI subprocess (injected as
+/// `CLAUDE_CODE_OAUTH_TOKEN`, letting the real binary own the OAuth + beta
+/// handshake), and the Codex token is held per-provider-instance rather than in
+/// the shared disk `TokenCache`. So one member's credential never leaks into
+/// another member's run.
+///
+/// `provider` is the wire provider name the bridge sends:
+///   - `anthropic` (alias `claude-code`) → Claude subscription via claude-code.
+///   - `openai-codex` (aliases `codex`, `chatgpt_codex`, `openai`) → ChatGPT Codex.
+///
+/// Only providers with an OAuth-native construction path are supported. Anything
+/// else is an error: callers must NOT fall back to `create` (env credentials)
+/// when an OAuth token was supplied, otherwise a request made on behalf of one
+/// credential would silently run on another.
+pub async fn create_with_oauth_token(
+    name: &str,
+    model: ModelConfig,
+    auth_token: String,
+) -> Result<Arc<dyn Provider>> {
+    match name {
+        "anthropic" | "claude-code" => Ok(Arc::new(ClaudeCodeProvider::from_oauth_token(
+            model, auth_token,
+        )?)),
+        "openai-codex" | "codex" | "chatgpt_codex" | "openai" => Ok(Arc::new(
+            ChatGptCodexProvider::from_oauth_token(model, auth_token)?,
+        )),
+        other => Err(anyhow::anyhow!(
+            "Provider '{}' does not support per-run OAuth tokens (supported: anthropic, openai-codex)",
+            other
+        )),
+    }
+}
+
 pub async fn create_with_working_dir(
     name: &str,
     model: ModelConfig,
@@ -269,6 +308,27 @@ mod tests {
         };
         assert!(
             err.to_string().contains("does not support per-run API keys"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_with_oauth_token_rejects_unsupported_provider() {
+        let err = match create_with_oauth_token(
+            "ollama",
+            ModelConfig::new_or_fail("some-model"),
+            "member-oauth-token".to_string(),
+        )
+        .await
+        {
+            Ok(_) => {
+                panic!("providers without oauth-token support must be rejected, not env-fallback")
+            }
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("does not support per-run OAuth tokens"),
             "unexpected error: {err}"
         );
     }
