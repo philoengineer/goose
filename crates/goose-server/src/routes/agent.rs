@@ -50,6 +50,32 @@ pub struct UpdateProviderRequest {
     session_id: String,
     context_limit: Option<usize>,
     request_params: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Per-run member credential. When set, the provider is constructed with
+    /// this key instead of the process-wide env/config secret, and the session
+    /// is marked `external_credential` so restores fail closed. The key itself
+    /// is NEVER persisted — callers must re-supply it on each update_provider.
+    #[serde(default)]
+    api_key: Option<String>,
+    /// Per-run OpenAI-compatible endpoint host (e.g. a member's own Venice
+    /// base URL). Only honored for `provider == "openai"` alongside `api_key`;
+    /// points the client at this host instead of the process-global OpenAI
+    /// endpoint. Never persisted.
+    #[serde(default)]
+    api_host: Option<String>,
+    /// Per-run member OAuth access token, present iff the credential is
+    /// OAuth-native (a member's Claude subscription `CLAUDE_CODE_OAUTH_TOKEN`
+    /// or ChatGPT Codex token). When set, the provider is built on this token
+    /// instead of the process-wide secret, and the session is marked
+    /// `external_credential` so restores fail closed. Never persisted — callers
+    /// must re-supply it on each `update_provider`.
+    #[serde(default)]
+    auth_token: Option<String>,
+    /// Which kind of per-run credential accompanies this request: `"oauth"`
+    /// (use `auth_token`) or `"api-key"` (use `api_key`). `#[serde(default)]`
+    /// keeps pre-OAuth request bodies (api-key only, no `credential_kind`)
+    /// deserializing, so the field is deploy-order-safe.
+    #[serde(default)]
+    credential_kind: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -555,6 +581,17 @@ async fn get_tools(
     Ok(Json(tools))
 }
 
+/// Which per-run credential (if any) an `update_provider` request carries, after
+/// reconciling `credential_kind` with the supplied `api_key`/`auth_token` fields.
+enum MemberCredential {
+    /// OAuth-native member token (Claude subscription / ChatGPT Codex).
+    OAuth(String),
+    /// Explicit API key, optionally with an OpenAI-compatible host override.
+    ApiKey(String, Option<String>),
+    /// No per-run credential: build from the process env/config secret.
+    Env,
+}
+
 #[utoipa::path(
     post,
     path = "/agent/update_provider",
@@ -606,12 +643,105 @@ async fn update_agent_provider(
         EnabledExtensionsState::for_session(state.session_manager(), &payload.session_id, config)
             .await;
 
-    let new_provider = create(&payload.provider, model_config, extensions)
+    // Resolve the credential mode. With any per-run credential the provider MUST
+    // be built from it (never a silent from_env fallback that would run one
+    // member's request on another's credential); an unsupported provider is a
+    // hard 400. `credential_kind` is authoritative when present; otherwise we
+    // fall back to which secret field was supplied, so a pre-OAuth bridge that
+    // only ever sends `api_key` keeps working (deploy-order-safe).
+    let external_credential = payload.api_key.is_some() || payload.auth_token.is_some();
+    let api_host = payload.api_host;
+    let credential = match payload.credential_kind.as_deref() {
+        Some("oauth") => {
+            let token = payload.auth_token.ok_or((
+                StatusCode::BAD_REQUEST,
+                "credential_kind 'oauth' requires auth_token".to_owned(),
+            ))?;
+            MemberCredential::OAuth(token)
+        }
+        Some("api-key") => {
+            let api_key = payload.api_key.ok_or((
+                StatusCode::BAD_REQUEST,
+                "credential_kind 'api-key' requires api_key".to_owned(),
+            ))?;
+            MemberCredential::ApiKey(api_key, api_host)
+        }
+        _ => match (payload.auth_token, payload.api_key) {
+            (Some(token), _) => MemberCredential::OAuth(token),
+            (None, Some(api_key)) => MemberCredential::ApiKey(api_key, api_host),
+            (None, None) => MemberCredential::Env,
+        },
+    };
+
+    let new_provider = match credential {
+        MemberCredential::OAuth(auth_token) => {
+            if auth_token.trim().is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "auth_token must not be empty when provided".to_owned(),
+                ));
+            }
+            goose::providers::create_with_oauth_token(&payload.provider, model_config, auth_token)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "Failed to create {} provider with oauth auth_token: {}",
+                            &payload.provider, e
+                        ),
+                    )
+                })?
+        }
+        MemberCredential::ApiKey(api_key, api_host) => {
+            if api_key.trim().is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "api_key must not be empty when provided".to_owned(),
+                ));
+            }
+            goose::providers::create_with_explicit_key(
+                &payload.provider,
+                model_config,
+                api_key,
+                api_host,
+            )
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Failed to create {} provider with explicit api_key: {}",
+                        &payload.provider, e
+                    ),
+                )
+            })?
+        }
+        MemberCredential::Env => create(&payload.provider, model_config, extensions)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to create {} provider: {}", &payload.provider, e),
+                )
+            })?,
+    };
+
+    // Record (only) whether the session runs on an external per-run credential
+    // so provider restoration fails closed instead of reaching for env keys.
+    // The key itself is never written anywhere. Persisted BEFORE the provider
+    // swap: if we crash in between, an externally-credentialed session is
+    // already marked (fail closed) rather than left restorable from env keys.
+    state
+        .session_manager()
+        .update(&payload.session_id)
+        .external_credential(external_credential)
+        .apply()
         .await
         .map_err(|e| {
             (
-                StatusCode::BAD_REQUEST,
-                format!("Failed to create {} provider: {}", &payload.provider, e),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to persist credential marker: {}", e),
             )
         })?;
 
@@ -1292,6 +1422,65 @@ mod tests {
     use goose::session::session_manager::SessionType;
     use rmcp::model::Tool;
     use rmcp::object;
+
+    #[test]
+    fn update_provider_request_deserializes_without_api_key() {
+        let req: UpdateProviderRequest = serde_json::from_str(
+            r#"{"provider":"anthropic","model":"claude-test","session_id":"s1"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.provider, "anthropic");
+        assert_eq!(req.session_id, "s1");
+        assert!(req.api_key.is_none());
+    }
+
+    #[test]
+    fn update_provider_request_deserializes_with_api_key() {
+        let req: UpdateProviderRequest = serde_json::from_str(
+            r#"{"provider":"anthropic","model":"claude-test","session_id":"s1","api_key":"sk-member-123"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.api_key.as_deref(), Some("sk-member-123"));
+        assert!(req.api_host.is_none());
+    }
+
+    #[test]
+    fn update_provider_request_deserializes_with_api_host() {
+        let req: UpdateProviderRequest = serde_json::from_str(
+            r#"{"provider":"openai","model":"gpt-4o","session_id":"s1","api_key":"venice-key","api_host":"https://api.venice.ai/api/v1"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.api_key.as_deref(), Some("venice-key"));
+        assert_eq!(req.api_host.as_deref(), Some("https://api.venice.ai/api/v1"));
+        // Old api-key body carries no oauth fields.
+        assert!(req.auth_token.is_none());
+        assert!(req.credential_kind.is_none());
+    }
+
+    #[test]
+    fn update_provider_request_deserializes_with_oauth_auth_token() {
+        let req: UpdateProviderRequest = serde_json::from_str(
+            r#"{"provider":"anthropic","model":"claude-sonnet-4-5","session_id":"s1","auth_token":"member-oauth-token","credential_kind":"oauth"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.auth_token.as_deref(), Some("member-oauth-token"));
+        assert_eq!(req.credential_kind.as_deref(), Some("oauth"));
+        // OAuth bodies never carry an api_key.
+        assert!(req.api_key.is_none());
+    }
+
+    #[test]
+    fn update_provider_request_credential_kind_defaults_when_absent() {
+        // A pre-OAuth bridge sends neither credential_kind nor auth_token; the
+        // body must still deserialize (deploy-order-safe).
+        let req: UpdateProviderRequest = serde_json::from_str(
+            r#"{"provider":"anthropic","model":"claude-test","session_id":"s1","api_key":"sk-member-123"}"#,
+        )
+        .unwrap();
+        assert!(req.credential_kind.is_none());
+        assert!(req.auth_token.is_none());
+        assert_eq!(req.api_key.as_deref(), Some("sk-member-123"));
+    }
 
     fn frontend_extension() -> ExtensionConfig {
         ExtensionConfig::Frontend {

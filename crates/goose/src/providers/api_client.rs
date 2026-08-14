@@ -368,6 +368,28 @@ impl ApiClient {
         Ok(self)
     }
 
+    /// Replace the authentication method on an already-built client.
+    ///
+    /// Used for per-run explicit credentials (see `providers::init::create_with_explicit_key`):
+    /// the client keeps its host/header/TLS setup but authenticates with the
+    /// supplied key instead of whatever the environment provided.
+    pub(crate) fn with_auth(mut self, auth: AuthMethod) -> Self {
+        self.auth = auth;
+        self
+    }
+
+    /// Read access to the configured auth method (crate-internal; used by tests).
+    #[cfg(test)]
+    pub(crate) fn auth(&self) -> &AuthMethod {
+        &self.auth
+    }
+
+    /// Read access to the configured host (crate-internal; used by tests).
+    #[cfg(test)]
+    pub(crate) fn host(&self) -> &str {
+        &self.host
+    }
+
     pub fn with_query(mut self, params: Vec<(String, String)>) -> Self {
         self.default_query = params;
         self

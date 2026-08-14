@@ -7808,6 +7808,10 @@
           "extension_data": {
             "$ref": "#/components/schemas/ExtensionData"
           },
+          "external_credential": {
+            "type": "boolean",
+            "description": "True when this session's provider was built from an explicitly\nsupplied per-run credential (see `/agent/update_provider` `api_key`).\nThe credential itself is NEVER persisted — only this marker, so that\nprovider restoration fails closed instead of silently falling back to\nthe process-wide env/config key."
+          },
           "goose_mode": {
             "$ref": "#/components/schemas/GooseMode"
           },
@@ -8876,10 +8880,30 @@
           "session_id"
         ],
         "properties": {
+          "api_host": {
+            "type": "string",
+            "description": "Per-run OpenAI-compatible endpoint host (e.g. a member's own Venice\nbase URL). Only honored for `provider == \"openai\"` alongside `api_key`;\npoints the client at this host instead of the process-global OpenAI\nendpoint. Never persisted.",
+            "nullable": true
+          },
+          "api_key": {
+            "type": "string",
+            "description": "Per-run member credential. When set, the provider is constructed with\nthis key instead of the process-wide env/config secret, and the session\nis marked `external_credential` so restores fail closed. The key itself\nis NEVER persisted — callers must re-supply it on each update_provider.",
+            "nullable": true
+          },
+          "auth_token": {
+            "type": "string",
+            "description": "Per-run member OAuth access token, present iff the credential is\nOAuth-native (a member's Claude subscription `CLAUDE_CODE_OAUTH_TOKEN`\nor ChatGPT Codex token). When set, the provider is built on this token\ninstead of the process-wide secret, and the session is marked\n`external_credential` so restores fail closed. Never persisted — callers\nmust re-supply it on each `update_provider`.",
+            "nullable": true
+          },
           "context_limit": {
             "type": "integer",
             "nullable": true,
             "minimum": 0
+          },
+          "credential_kind": {
+            "type": "string",
+            "description": "Which kind of per-run credential accompanies this request: `\"oauth\"`\n(use `auth_token`) or `\"api-key\"` (use `api_key`). `#[serde(default)]`\nkeeps pre-OAuth request bodies (api-key only, no `credential_kind`)\ndeserializing, so the field is deploy-order-safe.",
+            "nullable": true
           },
           "model": {
             "type": "string",

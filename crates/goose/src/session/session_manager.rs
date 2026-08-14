@@ -19,7 +19,7 @@ use std::sync::{Arc, LazyLock};
 use tracing::{info, warn};
 use utoipa::ToSchema;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 13;
+pub const CURRENT_SCHEMA_VERSION: i32 = 14;
 pub const SESSIONS_FOLDER: &str = "sessions";
 pub const DB_NAME: &str = "sessions.db";
 
@@ -86,6 +86,13 @@ pub struct Session {
     pub archived_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub project_id: Option<String>,
+    /// True when this session's provider was built from an explicitly
+    /// supplied per-run credential (see `/agent/update_provider` `api_key`).
+    /// The credential itself is NEVER persisted — only this marker, so that
+    /// provider restoration fails closed instead of silently falling back to
+    /// the process-wide env/config key.
+    #[serde(default)]
+    pub external_credential: bool,
 }
 
 pub struct SessionUpdateBuilder<'a> {
@@ -112,6 +119,7 @@ pub struct SessionUpdateBuilder<'a> {
     archived_at: Option<Option<DateTime<Utc>>>,
 
     project_id: Option<Option<String>>,
+    external_credential: Option<bool>,
 }
 
 #[derive(Serialize, ToSchema, Debug)]
@@ -146,6 +154,7 @@ impl<'a> SessionUpdateBuilder<'a> {
             goose_mode: None,
             archived_at: None,
             project_id: None,
+            external_credential: None,
         }
     }
 
@@ -266,6 +275,14 @@ impl<'a> SessionUpdateBuilder<'a> {
 
     pub fn project_id(mut self, project_id: Option<String>) -> Self {
         self.project_id = Some(project_id);
+        self
+    }
+
+    /// Mark whether this session's provider is authenticated with an
+    /// explicitly supplied per-run credential (the credential itself is
+    /// never stored). See `Session::external_credential`.
+    pub fn external_credential(mut self, external_credential: bool) -> Self {
+        self.external_credential = Some(external_credential);
         self
     }
 }
@@ -563,6 +580,7 @@ impl Default for Session {
             goose_mode: GooseMode::default(),
             archived_at: None,
             project_id: None,
+            external_credential: false,
         }
     }
 }
@@ -635,6 +653,7 @@ impl sqlx::FromRow<'_, sqlx::sqlite::SqliteRow> for Session {
                 .unwrap_or_default(),
             archived_at: row.try_get("archived_at").ok(),
             project_id: row.try_get("project_id").ok().flatten(),
+            external_credential: row.try_get("external_credential").unwrap_or(false),
         })
     }
 }
@@ -752,7 +771,8 @@ impl SessionStorage {
                 model_config_json TEXT,
                 goose_mode TEXT NOT NULL DEFAULT 'auto',
                 archived_at TIMESTAMP,
-                project_id TEXT
+                project_id TEXT,
+                external_credential BOOLEAN NOT NULL DEFAULT FALSE
             )
         "#,
         )
@@ -1187,6 +1207,25 @@ impl SessionStorage {
                         .await?;
                 }
             }
+            14 => {
+                // Marker for sessions whose provider was authenticated with an
+                // explicitly supplied per-run credential (the credential itself
+                // is never persisted). Guarded like migrations 12/13 because a
+                // fresh schema already contains the column.
+                let has_external_credential = sqlx::query_scalar::<_, i32>(
+                    "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'external_credential'",
+                )
+                .fetch_one(&mut **tx)
+                .await?
+                    > 0;
+                if !has_external_credential {
+                    sqlx::query(
+                        "ALTER TABLE sessions ADD COLUMN external_credential BOOLEAN NOT NULL DEFAULT FALSE",
+                    )
+                    .execute(&mut **tx)
+                    .await?;
+                }
+            }
             _ => {
                 anyhow::bail!("Unknown migration version: {}", version);
             }
@@ -1250,7 +1289,7 @@ impl SessionStorage {
                accumulated_cost,
                schedule_id, recipe_json, user_recipe_values_json,
                provider_name, model_config_json, goose_mode,
-               archived_at, project_id
+               archived_at, project_id, external_credential
         FROM sessions
         WHERE id = ?
     "#,
@@ -1318,6 +1357,7 @@ impl SessionStorage {
         add_update!(builder.archived_at, "archived_at");
 
         add_update!(builder.project_id, "project_id");
+        add_update!(builder.external_credential, "external_credential");
 
         if updates.is_empty() {
             return Ok(());
@@ -1395,6 +1435,10 @@ impl SessionStorage {
 
         if let Some(ref project_id) = builder.project_id {
             q = q.bind(project_id.as_ref());
+        }
+
+        if let Some(external_credential) = builder.external_credential {
+            q = q.bind(external_credential);
         }
 
         let pool = self.pool().await?;
@@ -1582,7 +1626,7 @@ impl SessionStorage {
                    s.accumulated_cost,
                    s.schedule_id, s.recipe_json, s.user_recipe_values_json,
                    s.provider_name, s.model_config_json, s.goose_mode,
-                   s.archived_at, s.project_id,
+                   s.archived_at, s.project_id, s.external_credential,
                    COUNT(m.id) as message_count
             FROM sessions s
             {}
@@ -2114,6 +2158,39 @@ mod tests {
         set_sessions_updated_at(sm, std::slice::from_ref(&session.id), updated_at).await;
 
         session.id
+    }
+
+    #[tokio::test]
+    async fn test_external_credential_marker_round_trip() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+
+        let session = sm
+            .create_session(
+                PathBuf::from("/tmp/external-cred"),
+                "external credential marker".to_string(),
+                SessionType::User,
+                GooseMode::default(),
+            )
+            .await
+            .unwrap();
+        assert!(!session.external_credential, "must default to false");
+
+        sm.update(&session.id)
+            .external_credential(true)
+            .apply()
+            .await
+            .unwrap();
+        let loaded = sm.get_session(&session.id, false).await.unwrap();
+        assert!(loaded.external_credential);
+
+        sm.update(&session.id)
+            .external_credential(false)
+            .apply()
+            .await
+            .unwrap();
+        let loaded = sm.get_session(&session.id, false).await.unwrap();
+        assert!(!loaded.external_credential);
     }
 
     #[tokio::test]

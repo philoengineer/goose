@@ -280,6 +280,79 @@ impl OpenAiProvider {
         })
     }
 
+    /// Build a provider authenticated with an explicitly supplied API key
+    /// (per-run member credential) instead of the stored `OPENAI_API_KEY`
+    /// secret. Reuses `from_env` for endpoint/header resolution — which never
+    /// fails on a missing key (it falls back to `NoAuth`) — then swaps in the
+    /// supplied bearer token. The key is only held in the constructed client
+    /// and is never persisted.
+    pub async fn from_key(model: ModelConfig, api_key: String) -> Result<Self> {
+        if api_key.trim().is_empty() {
+            return Err(anyhow::anyhow!("Explicit OpenAI API key must not be empty"));
+        }
+
+        let mut provider = Self::from_env(model).await?;
+        provider.api_client = provider
+            .api_client
+            .with_auth(AuthMethod::BearerToken(api_key));
+        Ok(provider)
+    }
+
+    /// Build a provider authenticated with an explicitly supplied API key
+    /// AND pointed at an explicitly supplied host (per-run member credential
+    /// against an OpenAI-compatible endpoint, e.g. Venice). Unlike `from_key`,
+    /// this reads NOTHING from process-global config — not `OPENAI_BASE_URL`,
+    /// `OPENAI_HOST`, `OPENAI_BASE_PATH`, org/project, or custom headers — so a
+    /// member's endpoint in a shared container cannot be shadowed by the box's
+    /// own OpenAI settings. The key/host are only held in the constructed
+    /// client and are never persisted.
+    pub fn from_key_with_host(model: ModelConfig, api_key: String, host: String) -> Result<Self> {
+        if api_key.trim().is_empty() {
+            return Err(anyhow::anyhow!("Explicit OpenAI API key must not be empty"));
+        }
+        if host.trim().is_empty() {
+            return Err(anyhow::anyhow!("Explicit OpenAI api_host must not be empty"));
+        }
+
+        // Parse the supplied host the same way OPENAI_BASE_URL is parsed:
+        // splits authority from any `/v1` path segment and query params, and
+        // reports whether the URL carried `/v1` (which selects the versioned
+        // vs versionless default base_path — matching the OpenAI SDK).
+        let (parsed_host, query_params, has_v1) = parse_openai_base_url(host.trim())?;
+        let base_path = if has_v1 {
+            OPEN_AI_DEFAULT_BASE_PATH.to_string()
+        } else {
+            OPEN_AI_VERSIONLESS_BASE_PATH.to_string()
+        };
+
+        let mut api_client = ApiClient::with_timeout(
+            parsed_host,
+            AuthMethod::BearerToken(api_key),
+            std::time::Duration::from_secs(DEFAULT_PROVIDER_TIMEOUT_SECS),
+        )?;
+
+        if !query_params.is_empty() {
+            api_client = api_client.with_query(query_params);
+        }
+
+        Ok(Self {
+            api_client,
+            base_path,
+            organization: None,
+            project: None,
+            model,
+            custom_headers: None,
+            supports_streaming: true,
+            name: OPEN_AI_PROVIDER_NAME.to_string(),
+            custom_models: None,
+            dynamic_models: None,
+            skip_canonical_filtering: false,
+            // Custom/compatible endpoints (Venice etc.) are never the native
+            // OpenAI host, so mirror from_env's non-OpenAI behavior.
+            preserve_thinking_context: true,
+        })
+    }
+
     #[doc(hidden)]
     pub fn new(api_client: ApiClient, model: ModelConfig) -> Self {
         Self {
@@ -978,6 +1051,42 @@ mod tests {
             skip_canonical_filtering: false,
             preserve_thinking_context: false,
         }
+    }
+
+    #[test]
+    fn from_key_with_host_targets_supplied_host() {
+        // Venice-style OpenAI-compatible base URL.
+        let provider = match OpenAiProvider::from_key_with_host(
+            ModelConfig::new_or_fail("gpt-4o"),
+            "member-venice-key".to_string(),
+            "https://api.venice.ai/api/v1".to_string(),
+        ) {
+            Ok(provider) => provider,
+            Err(err) => panic!("from_key_with_host should build: {err}"),
+        };
+
+        // Host derived from the SUPPLIED value, not the process-global OpenAI
+        // host; `/v1` segment stripped to authority+prefix, base_path versioned.
+        assert_eq!(provider.api_client.host(), "https://api.venice.ai/api");
+        assert_eq!(provider.base_path, "v1/chat/completions");
+        assert_eq!(provider.name, OPEN_AI_PROVIDER_NAME);
+        match provider.api_client.auth() {
+            AuthMethod::BearerToken(key) => assert_eq!(key, "member-venice-key"),
+            _ => panic!("expected AuthMethod::BearerToken carrying the supplied key"),
+        }
+    }
+
+    #[test]
+    fn from_key_with_host_rejects_empty_host() {
+        let err = match OpenAiProvider::from_key_with_host(
+            ModelConfig::new_or_fail("gpt-4o"),
+            "member-key".to_string(),
+            "   ".to_string(),
+        ) {
+            Ok(_) => panic!("empty api_host must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("api_host must not be empty"));
     }
 
     #[test]

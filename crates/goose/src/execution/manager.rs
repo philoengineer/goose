@@ -179,7 +179,9 @@ impl AgentManager {
         );
         let agent = Arc::new(Agent::with_config(config));
 
+        let mut external_credential = false;
         if let Ok(session) = self.session_manager.get_session(session_id, false).await {
+            external_credential = session.external_credential;
             if session.provider_name.is_some() {
                 info!(
                     "Restoring evicted session {} (provider: {:?})",
@@ -196,7 +198,11 @@ impl AgentManager {
             agent.load_extensions_from_session(&session).await;
         }
 
-        if agent.provider().await.is_err() {
+        // Fail closed: a session credentialed with an explicit per-run key
+        // must never silently fall back to the process-wide default provider.
+        // Its provider stays unset until the caller re-supplies the key via
+        // /agent/update_provider.
+        if agent.provider().await.is_err() && !external_credential {
             if let Some(provider) = &*self.default_provider.read().await {
                 agent
                     .update_provider(Arc::clone(provider), session_id)
