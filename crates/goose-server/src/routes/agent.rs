@@ -24,7 +24,7 @@ use goose::providers::create;
 use goose::recipe::Recipe;
 use goose::recipe_deeplink;
 use goose::session::session_manager::SessionType;
-use goose::session::{EnabledExtensionsState, ExtensionState, Session};
+use goose::session::{EnabledExtensionsState, ExtensionState, Session, SessionMemberState};
 use goose::{
     agents::{extension::ToolInfo, extension_manager::get_parameter_names},
     config::permission::PermissionLevel,
@@ -101,6 +101,11 @@ pub struct StartAgentRequest {
     recipe_deeplink: Option<String>,
     #[serde(default)]
     extension_overrides: Option<Vec<ExtensionConfig>>,
+    /// Fabrica T-BYOM (2026-08-19): the member this session belongs to.
+    /// Additive + serde(default) → deploy-order-safe; shape-guarded before
+    /// storage (SessionMemberState::sanitize). See extension_data.rs.
+    #[serde(default)]
+    session_member: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -210,6 +215,7 @@ pub struct RestartAgentResponse {
 #[allow(clippy::too_many_lines)]
 async fn start_agent(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(payload): Json<StartAgentRequest>,
 ) -> Result<Json<Session>, ErrorResponse> {
     #[cfg(feature = "telemetry")]
@@ -221,7 +227,20 @@ async fn start_agent(
         recipe_id,
         recipe_deeplink,
         extension_overrides,
+        session_member,
     } = payload;
+
+    // Fabrica T-BYOM (2026-08-19): the edge-authed X-Member header outranks
+    // the body field. On the SPA lane Caddy's forward_auth STAMPS X-Member
+    // from the verified session (a browser can forge the body field but
+    // never that header); the bridge's server-driven lane has no Caddy in
+    // front and sends session_member in the body. Both are shape-guarded
+    // again at storage (SessionMemberState::sanitize).
+    let session_member = headers
+        .get("x-member")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .or(session_member);
 
     let original_recipe = if let Some(deeplink) = recipe_deeplink {
         match recipe_deeplink::decode(&deeplink) {
@@ -285,6 +304,15 @@ async fn start_agent(
         resolve_extensions_for_new_session(recipe_extensions, extension_overrides);
 
     let mut extension_data = session.extension_data.clone();
+    // Fabrica T-BYOM (2026-08-19): persist the session's member (shape-guarded)
+    // so stdio-extension spawns can inject GOOSE_SESSION_MEMBER (see
+    // extension_manager.rs) and member-aware extensions bill the member,
+    // not the box. Invalid/absent → memberless session, byte-identical.
+    if let Some(member) = session_member.as_deref().and_then(SessionMemberState::sanitize) {
+        if let Err(e) = (SessionMemberState { member }).to_extension_data(&mut extension_data) {
+            tracing::warn!("Failed to store session member: {}", e);
+        }
+    }
     let extensions_state = EnabledExtensionsState::new(extensions_to_use);
     if let Err(e) = extensions_state.to_extension_data(&mut extension_data) {
         tracing::warn!("Failed to initialize session with extensions: {}", e);

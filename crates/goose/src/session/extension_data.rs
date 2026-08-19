@@ -99,6 +99,43 @@ impl TodoState {
     }
 }
 
+/// Fabrica T-BYOM (2026-08-19): the MEMBER a session belongs to. Set from
+/// StartAgentRequest.session_member (the bridge / an edge-authed caller
+/// asserts it at session start); read at stdio-extension spawn to inject
+/// GOOSE_SESSION_MEMBER into the subprocess env, so member-aware extensions
+/// (streamgen / websearch) route their LLM calls through the bridge on the
+/// member's OWN credential instead of the container's box key. Absent for
+/// owner/legacy sessions — extensions then keep today's box-key path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMemberState {
+    pub member: String,
+}
+
+impl ExtensionState for SessionMemberState {
+    const EXTENSION_NAME: &'static str = "fabrica_session_member";
+    const VERSION: &'static str = "v0";
+}
+
+impl SessionMemberState {
+    /// Shape-guard a caller-supplied member uid (the same [a-z0-9_-]{1,40}
+    /// rule as the bridge's _safe_member_uid). None → not stored, session
+    /// stays memberless.
+    pub fn sanitize(raw: &str) -> Option<String> {
+        let uid = raw.trim().to_lowercase();
+        if uid.is_empty() || uid.len() > 40 {
+            return None;
+        }
+        if uid
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        {
+            Some(uid)
+        } else {
+            None
+        }
+    }
+}
+
 /// Enabled extensions state implementation for storing which extensions are active
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnabledExtensionsState {
@@ -298,5 +335,40 @@ mod tests {
         assert!(!names
             .iter()
             .any(|name| name == "definitely_not_real_platform_extension"));
+    }
+}
+
+#[cfg(test)]
+mod session_member_tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_accepts_valid_uids_and_normalizes() {
+        assert_eq!(SessionMemberState::sanitize(" Vera "), Some("vera".into()));
+        assert_eq!(SessionMemberState::sanitize("a-b_c9"), Some("a-b_c9".into()));
+    }
+
+    #[test]
+    fn sanitize_rejects_bad_shapes() {
+        assert_eq!(SessionMemberState::sanitize(""), None);
+        assert_eq!(SessionMemberState::sanitize("has space"), None);
+        assert_eq!(SessionMemberState::sanitize("dot.dot"), None);
+        assert_eq!(SessionMemberState::sanitize(&"a".repeat(41)), None);
+    }
+
+    #[test]
+    fn round_trips_through_extension_data() {
+        let mut data = ExtensionData::new();
+        let state = SessionMemberState { member: "vera".into() };
+        state.to_extension_data(&mut data).unwrap();
+        let back = SessionMemberState::from_extension_data(&data).unwrap();
+        assert_eq!(back.member, "vera");
+        // versioned key, so it can never collide with a real extension's state
+        assert!(data.extension_states.contains_key("fabrica_session_member.v0"));
+    }
+
+    #[test]
+    fn absent_state_is_none() {
+        assert!(SessionMemberState::from_extension_data(&ExtensionData::new()).is_none());
     }
 }
