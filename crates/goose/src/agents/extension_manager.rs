@@ -39,6 +39,7 @@ use crate::agents::mcp_client::{
 };
 use crate::builtin_extension::get_builtin_extension;
 use crate::config::extensions::name_to_key;
+use crate::session::ExtensionState as _; // SessionMemberState::from_extension_data (T-BYOM)
 use crate::config::search_path::SearchPaths;
 use crate::config::{get_all_extensions, Config};
 use crate::oauth::{oauth_flow, GooseCredentialStore};
@@ -951,6 +952,28 @@ impl ExtensionManager {
 
                 if let Some(sid) = session_id {
                     all_envs.insert("AGENT_SESSION_ID".to_string(), sid.to_string());
+                }
+
+                // Fabrica T-BYOM (2026-08-19): a session started FOR A MEMBER
+                // (StartAgentRequest.session_member -> SessionMemberState) tells
+                // its stdio extensions which member they serve — streamgen /
+                // websearch then route LLM calls through the bridge on the
+                // member's OWN credential (services/_shared/models_resolve.py
+                // member_completion). Absent -> memberless env, box-key path.
+                if let Some(sid) = session_id {
+                    if let Ok(session) = self
+                        .context
+                        .session_manager
+                        .get_session(sid, false)
+                        .await
+                    {
+                        if let Some(state) = crate::session::SessionMemberState::
+                            from_extension_data(&session.extension_data)
+                        {
+                            all_envs
+                                .insert("GOOSE_SESSION_MEMBER".to_string(), state.member);
+                        }
+                    }
                 }
 
                 // Check for malicious packages before launching the process

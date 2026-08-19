@@ -8209,6 +8209,11 @@
             "type": "string",
             "nullable": true
           },
+          "session_member": {
+            "type": "string",
+            "description": "Fabrica T-BYOM (2026-08-19): the member this session belongs to.\nAdditive + serde(default) → deploy-order-safe; shape-guarded before\nstorage (SessionMemberState::sanitize). See extension_data.rs.",
+            "nullable": true
+          },
           "working_dir": {
             "type": "string"
           }
