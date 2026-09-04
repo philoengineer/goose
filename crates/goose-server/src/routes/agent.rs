@@ -662,10 +662,25 @@ async fn update_agent_provider(
     if let Some(request_params) = payload.request_params {
         model_config = model_config.with_merged_request_params(request_params);
     }
-    let model_info = resolve_provider_model_info(&payload.provider, &model)
-        .await
-        .map_err(|e| (e.status, e.message))?;
-    model_config.reasoning = Some(model_info.reasoning);
+    // Per-run credential (BYOM 2026-09-04): the member's own key/token may be
+    // for a provider this goosed has NO global credential for (openrouter /
+    // venice / openai on a box that only carries ANTHROPIC_API_KEY).
+    // resolve_provider_model_info gates on the GLOBAL config and builds the
+    // provider from env, so for an external credential it is advisory only:
+    // use the model info when it resolves, otherwise leave `reasoning` unset
+    // rather than 400 "Provider 'x' is not configured" — the credential
+    // branch below builds the provider from the supplied key regardless.
+    let has_external_credential = payload.api_key.is_some() || payload.auth_token.is_some();
+    if has_external_credential {
+        if let Ok(model_info) = resolve_provider_model_info(&payload.provider, &model).await {
+            model_config.reasoning = Some(model_info.reasoning);
+        }
+    } else {
+        let model_info = resolve_provider_model_info(&payload.provider, &model)
+            .await
+            .map_err(|e| (e.status, e.message))?;
+        model_config.reasoning = Some(model_info.reasoning);
+    }
 
     let extensions =
         EnabledExtensionsState::for_session(state.session_manager(), &payload.session_id, config)
