@@ -25,11 +25,6 @@ export type ActionRequiredData = {
     user_data: unknown;
 };
 
-export type AddExtensionRequest = {
-    config: ExtensionConfig;
-    session_id: string;
-};
-
 export type Annotations = {
     audience?: Array<Role>;
     lastModified?: string;
@@ -74,6 +69,16 @@ export type ChatRequest = {
     recipe_version?: string | null;
     session_id: string;
     user_message: Message;
+};
+
+export type ChatTemplate = {
+    type: 'embedded';
+} | {
+    name: string;
+    type: 'builtin';
+} | {
+    template: string;
+    type: 'custom_inline';
 };
 
 export type CheckProviderRequest = {
@@ -231,6 +236,7 @@ export type DeclarativeProviderConfig = {
     model_doc_link?: string | null;
     models: Array<ModelInfo>;
     name: string;
+    preserves_thinking?: boolean;
     requires_auth?: boolean;
     setup_steps?: Array<string>;
     skip_canonical_filtering?: boolean;
@@ -482,17 +488,6 @@ export type ExtensionLoadResult = {
     success: boolean;
 };
 
-export type ExtensionQuery = {
-    config: ExtensionConfig;
-    enabled: boolean;
-    name: string;
-};
-
-export type ExtensionResponse = {
-    extensions: Array<ExtensionEntry>;
-    warnings?: Array<string>;
-};
-
 export type FeaturesResponse = {
     /**
      * Map of feature name to enabled status
@@ -599,6 +594,12 @@ export type ImportSessionNostrRequest = {
 
 export type ImportSessionRequest = {
     json: string;
+};
+
+export type InferenceMetadata = {
+    provider: string;
+    requestedModel: string;
+    resolvedModel?: string | null;
 };
 
 export type InspectJobResponse = {
@@ -745,13 +746,14 @@ export type MessageEvent = {
 };
 
 /**
- * Metadata for message visibility
+ * Metadata for message visibility and model inference details
  */
 export type MessageMetadata = {
     /**
      * Whether the message should be included in the agent's context window
      */
     agentVisible: boolean;
+    inference?: InferenceMetadata | null;
     /**
      * Whether the message should be visible to the user in the UI
      */
@@ -818,6 +820,14 @@ export type ModelInfo = {
      */
     output_token_cost?: number | null;
     /**
+     * Whether this model supports reasoning/thinking controls
+     */
+    reasoning?: boolean;
+    /**
+     * The underlying model resolved from provider metadata, when the configured model is an alias or endpoint.
+     */
+    resolved_model?: string | null;
+    /**
      * Whether this model supports cache control
      */
     supports_cache_control?: boolean | null;
@@ -833,6 +843,7 @@ export type ModelInfoData = {
     model: string;
     output_token_cost?: number | null;
     provider: string;
+    reasoning: boolean;
 };
 
 export type ModelInfoQuery = {
@@ -846,6 +857,7 @@ export type ModelInfoResponse = {
 };
 
 export type ModelSettings = {
+    chat_template?: ChatTemplate;
     context_size?: number | null;
     enable_thinking?: boolean;
     flash_attention?: boolean | null;
@@ -863,16 +875,15 @@ export type ModelSettings = {
     n_batch?: number | null;
     n_gpu_layers?: number | null;
     n_threads?: number | null;
-    native_tool_calling?: boolean;
     presence_penalty?: number;
     repeat_last_n?: number;
     repeat_penalty?: number;
     sampling?: SamplingConfig;
-    use_jinja?: boolean;
+    tool_calling?: ToolCallingMode;
     use_mlock?: boolean;
     /**
      * Whether this model architecture supports vision input.
-     * Derived from the featured model table, not user-configurable.
+     * Derived from associated mmproj metadata, not user-configurable.
      */
     vision_capable?: boolean;
 };
@@ -952,6 +963,7 @@ export type ProviderDetails = {
     metadata: ProviderMetadata;
     name: string;
     provider_type: ProviderType;
+    saved_model?: string | null;
 };
 
 export type ProviderEngine = 'openai' | 'ollama' | 'anthropic';
@@ -996,6 +1008,10 @@ export type ProviderMetadata = {
      * step-by-step instructions for set up providers eg: api key
      */
     setup_steps?: Array<string>;
+};
+
+export type ProviderModelInfoQuery = {
+    model: string;
 };
 
 export type ProviderTemplate = {
@@ -1118,11 +1134,6 @@ export type RecipeToYamlResponse = {
 
 export type RedactedThinkingContent = {
     data: string;
-};
-
-export type RemoveExtensionRequest = {
-    name: string;
-    session_id: string;
 };
 
 export type RepoVariantsResponse = {
@@ -1272,6 +1283,7 @@ export type ScheduledJob = {
 };
 
 export type Session = {
+    accumulated_cost?: number | null;
     accumulated_input_tokens?: number | null;
     accumulated_output_tokens?: number | null;
     accumulated_total_tokens?: number | null;
@@ -1313,10 +1325,6 @@ export type SessionDisplayInfo = {
     scheduleId?: string | null;
     totalTokens?: number | null;
     workingDir: string;
-};
-
-export type SessionExtensionsResponse = {
-    extensions: Array<ExtensionConfig>;
 };
 
 export type SessionInsights = {
@@ -1479,7 +1487,10 @@ export type ThinkingContent = {
     thinking: string;
 };
 
+export type ThinkingEffort = 'off' | 'low' | 'medium' | 'high' | 'max';
+
 export type TokenState = {
+    accumulatedCost?: number | null;
     accumulatedInputTokens: number;
     accumulatedOutputTokens: number;
     accumulatedTotalTokens: number;
@@ -1517,6 +1528,8 @@ export type ToolAnnotations = {
     readOnlyHint?: boolean;
     title?: string;
 };
+
+export type ToolCallingMode = 'auto' | 'force_native' | 'force_emulated';
 
 export type ToolConfirmationRequest = {
     arguments: JsonObject;
@@ -1627,6 +1640,7 @@ export type UpdateCustomProviderRequest = {
         [key: string]: string;
     } | null;
     models: Array<string>;
+    preserves_thinking?: boolean | null;
     requires_auth?: boolean;
     supports_streaming?: boolean | null;
 };
@@ -1741,37 +1755,6 @@ export type ConfirmToolActionResponses = {
      */
     200: unknown;
 };
-
-export type AgentAddExtensionData = {
-    body: AddExtensionRequest;
-    path?: never;
-    query?: never;
-    url: '/agent/add_extension';
-};
-
-export type AgentAddExtensionErrors = {
-    /**
-     * Unauthorized - invalid secret key
-     */
-    401: unknown;
-    /**
-     * Agent not initialized
-     */
-    424: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type AgentAddExtensionResponses = {
-    /**
-     * Extension added
-     */
-    200: string;
-};
-
-export type AgentAddExtensionResponse = AgentAddExtensionResponses[keyof AgentAddExtensionResponses];
 
 export type CallToolData = {
     body: CallToolRequest;
@@ -1942,37 +1925,6 @@ export type ReadResourceResponses = {
 };
 
 export type ReadResourceResponse2 = ReadResourceResponses[keyof ReadResourceResponses];
-
-export type AgentRemoveExtensionData = {
-    body: RemoveExtensionRequest;
-    path?: never;
-    query?: never;
-    url: '/agent/remove_extension';
-};
-
-export type AgentRemoveExtensionErrors = {
-    /**
-     * Unauthorized - invalid secret key
-     */
-    401: unknown;
-    /**
-     * Agent not initialized
-     */
-    424: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type AgentRemoveExtensionResponses = {
-    /**
-     * Extension removed
-     */
-    200: string;
-};
-
-export type AgentRemoveExtensionResponse = AgentRemoveExtensionResponses[keyof AgentRemoveExtensionResponses];
 
 export type RestartAgentData = {
     body: RestartAgentRequest;
@@ -2409,89 +2361,6 @@ export type UpdateCustomProviderResponses = {
 
 export type UpdateCustomProviderResponse = UpdateCustomProviderResponses[keyof UpdateCustomProviderResponses];
 
-export type GetExtensionsData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/config/extensions';
-};
-
-export type GetExtensionsErrors = {
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type GetExtensionsResponses = {
-    /**
-     * All extensions retrieved successfully
-     */
-    200: ExtensionResponse;
-};
-
-export type GetExtensionsResponse = GetExtensionsResponses[keyof GetExtensionsResponses];
-
-export type AddExtensionData = {
-    body: ExtensionQuery;
-    path?: never;
-    query?: never;
-    url: '/config/extensions';
-};
-
-export type AddExtensionErrors = {
-    /**
-     * Invalid request
-     */
-    400: unknown;
-    /**
-     * Could not serialize config.yaml
-     */
-    422: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type AddExtensionResponses = {
-    /**
-     * Extension added or updated successfully
-     */
-    200: string;
-};
-
-export type AddExtensionResponse = AddExtensionResponses[keyof AddExtensionResponses];
-
-export type RemoveExtensionData = {
-    body?: never;
-    path: {
-        name: string;
-    };
-    query?: never;
-    url: '/config/extensions/{name}';
-};
-
-export type RemoveExtensionErrors = {
-    /**
-     * Extension not found
-     */
-    404: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type RemoveExtensionResponses = {
-    /**
-     * Extension removed successfully
-     */
-    200: string;
-};
-
-export type RemoveExtensionResponse = RemoveExtensionResponses[keyof RemoveExtensionResponses];
-
 export type UpsertPermissionsData = {
     body: UpsertPermissionsQuery;
     path?: never;
@@ -2723,6 +2592,42 @@ export type CleanupProviderCacheResponses = {
 
 export type CleanupProviderCacheResponse = CleanupProviderCacheResponses[keyof CleanupProviderCacheResponses];
 
+export type GetProviderModelInfoData = {
+    body: ProviderModelInfoQuery;
+    path: {
+        /**
+         * Provider name (e.g., openai)
+         */
+        name: string;
+    };
+    query?: never;
+    url: '/config/providers/{name}/model-info';
+};
+
+export type GetProviderModelInfoErrors = {
+    /**
+     * Unknown provider, provider not configured, or authentication error
+     */
+    400: unknown;
+    /**
+     * Rate limit exceeded
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetProviderModelInfoResponses = {
+    /**
+     * Model metadata fetched successfully
+     */
+    200: ModelInfo;
+};
+
+export type GetProviderModelInfoResponse = GetProviderModelInfoResponses[keyof GetProviderModelInfoResponses];
+
 export type GetProviderModelsData = {
     body?: never;
     path: {
@@ -2754,7 +2659,7 @@ export type GetProviderModelsResponses = {
     /**
      * Models fetched successfully
      */
-    200: Array<string>;
+    200: Array<ModelInfo>;
 };
 
 export type GetProviderModelsResponse = GetProviderModelsResponses[keyof GetProviderModelsResponses];
@@ -3177,6 +3082,22 @@ export type StartTetrateSetupResponses = {
 };
 
 export type StartTetrateSetupResponse = StartTetrateSetupResponses[keyof StartTetrateSetupResponses];
+
+export type ListBuiltinChatTemplatesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/local-inference/chat-templates/builtin';
+};
+
+export type ListBuiltinChatTemplatesResponses = {
+    /**
+     * llama.cpp built-in chat template names
+     */
+    200: Array<string>;
+};
+
+export type ListBuiltinChatTemplatesResponse = ListBuiltinChatTemplatesResponses[keyof ListBuiltinChatTemplatesResponses];
 
 export type DownloadHfModelData = {
     body: DownloadModelRequest;
@@ -4404,42 +4325,6 @@ export type ExportSessionResponses = {
 };
 
 export type ExportSessionResponse = ExportSessionResponses[keyof ExportSessionResponses];
-
-export type GetSessionExtensionsData = {
-    body?: never;
-    path: {
-        /**
-         * Unique identifier for the session
-         */
-        session_id: string;
-    };
-    query?: never;
-    url: '/sessions/{session_id}/extensions';
-};
-
-export type GetSessionExtensionsErrors = {
-    /**
-     * Unauthorized - Invalid or missing API key
-     */
-    401: unknown;
-    /**
-     * Session not found
-     */
-    404: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type GetSessionExtensionsResponses = {
-    /**
-     * Session extensions retrieved successfully
-     */
-    200: SessionExtensionsResponse;
-};
-
-export type GetSessionExtensionsResponse = GetSessionExtensionsResponses[keyof GetSessionExtensionsResponses];
 
 export type ForkSessionData = {
     body: ForkRequest;

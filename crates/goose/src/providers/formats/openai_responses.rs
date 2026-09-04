@@ -2,7 +2,9 @@ use crate::conversation::message::{Message, MessageContent};
 use crate::mcp_utils::extract_text_from_resource;
 use crate::model::ModelConfig;
 use crate::providers::base::{ProviderUsage, Usage};
-use crate::providers::utils::{extract_reasoning_effort, is_openai_responses_model};
+use crate::providers::utils::{
+    extract_reasoning_effort, is_openai_responses_model, openai_reasoning_effort_for_thinking,
+};
 use anyhow::{anyhow, Error};
 use async_stream::try_stream;
 use chrono;
@@ -271,6 +273,7 @@ pub struct ResponseMetadata {
     pub created_at: i64,
     pub status: String,
     pub model: String,
+    #[serde(default)]
     pub output: Vec<ResponseOutputItemInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<ResponseUsage>,
@@ -541,11 +544,26 @@ pub fn create_responses_request(
 
     add_message_items(&mut input_items, messages);
 
-    let (model_name, reasoning_effort) = extract_reasoning_effort(&model_config.model_name);
+    let (model_name, legacy_reasoning_effort) = extract_reasoning_effort(&model_config.model_name);
     // All models routed here are responses-capable; temperature is rejected
     // by the API for reasoning models regardless of whether an explicit
     // effort suffix was provided.
     let is_reasoning_model = is_openai_responses_model(&model_name);
+    let reasoning_effort = if is_reasoning_model {
+        if let Some(effort) = legacy_reasoning_effort.as_deref() {
+            effort
+                .parse()
+                .ok()
+                .and_then(|effort| openai_reasoning_effort_for_thinking(&model_name, effort))
+                .or(legacy_reasoning_effort)
+        } else {
+            model_config
+                .thinking_effort()
+                .and_then(|effort| openai_reasoning_effort_for_thinking(&model_name, effort))
+        }
+    } else {
+        None
+    };
 
     let mut payload = json!({
         "model": model_name,
@@ -964,6 +982,47 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_responses_stream_completed_allows_missing_output() -> anyhow::Result<()> {
+        let lines = vec![
+            r#"data: {"type":"response.created","sequence_number":1,"response":{"id":"resp_1","object":"response","created_at":1737368310,"status":"in_progress","model":"gpt-5.2-pro","output":[]}}"#.to_string(),
+            r#"data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"msg_1","output_index":0,"content_index":0,"delta":"Hello"}"#.to_string(),
+            r#"data: {"type":"response.output_text.delta","sequence_number":3,"item_id":"msg_1","output_index":0,"content_index":0,"delta":" world"}"#.to_string(),
+            r#"data: {"type":"response.completed","sequence_number":4,"response":{"id":"resp_1","object":"response","created_at":1737368310,"status":"completed","model":"gpt-5.2-pro","usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14}}}"#.to_string(),
+            "data: [DONE]".to_string(),
+        ];
+
+        let response_stream = tokio_stream::iter(lines.into_iter().map(Ok));
+        let messages = responses_api_to_streaming_message(response_stream);
+        futures::pin_mut!(messages);
+
+        let mut text_parts = Vec::new();
+        let mut usage: Option<ProviderUsage> = None;
+
+        while let Some(item) = messages.next().await {
+            let (message, maybe_usage) = item?;
+            if let Some(msg) = message {
+                for content in msg.content {
+                    if let MessageContent::Text(text) = content {
+                        text_parts.push(text.text.clone());
+                    }
+                }
+            }
+            if let Some(final_usage) = maybe_usage {
+                usage = Some(final_usage);
+            }
+        }
+
+        assert_eq!(text_parts.concat(), "Hello world");
+        let usage = usage.expect("usage should be present at completion");
+        assert_eq!(usage.model, "gpt-5.2-pro");
+        assert_eq!(usage.usage.input_tokens, Some(10));
+        assert_eq!(usage.usage.output_tokens, Some(4));
+        assert_eq!(usage.usage.total_tokens, Some(14));
+
+        Ok(())
+    }
+
     #[test]
     fn test_responses_api_to_message_captures_reasoning_summary() -> anyhow::Result<()> {
         let response: ResponsesApiResponse = serde_json::from_value(serde_json::json!({
@@ -1269,6 +1328,17 @@ mod tests {
     }
 
     #[test]
+    fn test_responses_request_with_normalized_effort_suffix() {
+        let model_config = ModelConfig::new("o3-mini-high").unwrap();
+
+        let result = create_responses_request(&model_config, "You are helpful.", &[], &[]).unwrap();
+
+        assert_eq!(result["model"], "o3-mini");
+        assert_eq!(result["reasoning"]["effort"], "high");
+        assert_eq!(result["reasoning"]["summary"], "auto");
+    }
+
+    #[test]
     fn test_responses_request_without_effort_suffix_omits_reasoning() {
         for model_name in ["gpt-5.4", "o3", "gpt-5-nano"] {
             let model_config = ModelConfig {
@@ -1292,6 +1362,30 @@ mod tests {
                 "reasoning should be omitted for {model_name} without explicit effort suffix"
             );
         }
+    }
+
+    #[test]
+    fn test_responses_request_non_reasoning_model_ignores_global_thinking_effort() {
+        let _guard = env_lock::lock_env([("GOOSE_THINKING_EFFORT", Some("high"))]);
+        let model_config = ModelConfig {
+            model_name: "gpt-4o".to_string(),
+            context_limit: None,
+            temperature: None,
+            max_tokens: None,
+            toolshim: false,
+            toolshim_model: None,
+            fast_model_config: None,
+            request_params: None,
+            reasoning: None,
+        };
+
+        let result = create_responses_request(&model_config, "You are helpful.", &[], &[]).unwrap();
+
+        assert_eq!(result["model"], "gpt-4o");
+        assert!(
+            result.get("reasoning").is_none(),
+            "non-reasoning models should not receive reasoning config"
+        );
     }
 
     #[test]

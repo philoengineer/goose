@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 #[cfg(feature = "aws-providers")]
@@ -20,6 +21,7 @@ use super::{
     copilot_acp::CopilotAcpProvider,
     cursor_agent::CursorAgentProvider,
     databricks::DatabricksProvider,
+    databricks_v2::DatabricksV2Provider,
     gcpvertexai::GcpVertexAIProvider,
     gemini_cli::GeminiCliProvider,
     gemini_oauth::GeminiOAuthProvider,
@@ -35,7 +37,6 @@ use super::{
     provider_registry::ProviderRegistry,
     snowflake::SnowflakeProvider,
     tetrate::TetrateProvider,
-    venice::VeniceProvider,
     xai::XaiProvider,
 };
 use crate::config::ExtensionConfig;
@@ -68,6 +69,7 @@ async fn init_registry() -> RwLock<ProviderRegistry> {
         registry.register::<CodexProvider>(true);
         registry.register::<CursorAgentProvider>(false);
         registry.register::<DatabricksProvider>(true);
+        registry.register::<DatabricksV2Provider>(false);
         registry.register::<GcpVertexAIProvider>(false);
         registry.register::<GeminiCliProvider>(false);
         registry.register::<GeminiOAuthProvider>(true);
@@ -84,7 +86,6 @@ async fn init_registry() -> RwLock<ProviderRegistry> {
         registry.register::<SageMakerTgiProvider>(false);
         registry.register::<SnowflakeProvider>(false);
         registry.register::<TetrateProvider>(true);
-        registry.register::<VeniceProvider>(false);
         registry.register::<XaiProvider>(false);
     });
     // Register cleanup functions for providers with cached state
@@ -95,6 +96,10 @@ async fn init_registry() -> RwLock<ProviderRegistry> {
     registry.set_cleanup(
         "databricks",
         Arc::new(|| Box::pin(DatabricksProvider::cleanup())),
+    );
+    registry.set_cleanup(
+        "databricks_v2",
+        Arc::new(|| Box::pin(DatabricksV2Provider::cleanup())),
     );
     registry.set_cleanup(
         "kimi_code",
@@ -162,6 +167,91 @@ pub async fn create(
     entry.create(model, extensions).await
 }
 
+/// Build a provider authenticated with an explicitly supplied API key
+/// (per-run member credential) instead of the process-wide config/env secret.
+///
+/// `api_host`, when set, points an OpenAI-compatible provider at the member's
+/// own endpoint (e.g. Venice) instead of the process-global OpenAI host — used
+/// so a member's own key/endpoint runs in a shared container without picking up
+/// the box's OpenAI settings.
+///
+/// Only providers with a clean explicit-key construction path are supported.
+/// Anything else is an error: callers must NOT fall back to `create` (env
+/// credentials) when an explicit key was supplied, otherwise a request made
+/// on behalf of one credential would silently run on another.
+pub async fn create_with_explicit_key(
+    name: &str,
+    model: ModelConfig,
+    api_key: String,
+    api_host: Option<String>,
+) -> Result<Arc<dyn Provider>> {
+    match name {
+        "anthropic" => Ok(Arc::new(AnthropicProvider::from_key(model, api_key)?)),
+        "openai" => match api_host {
+            Some(host) => Ok(Arc::new(OpenAiProvider::from_key_with_host(
+                model, api_key, host,
+            )?)),
+            None => Ok(Arc::new(OpenAiProvider::from_key(model, api_key).await?)),
+        },
+        "openrouter" => Ok(Arc::new(OpenRouterProvider::from_key(model, api_key)?)),
+        other => Err(anyhow::anyhow!(
+            "Provider '{}' does not support per-run API keys (supported: anthropic, openai, openrouter)",
+            other
+        )),
+    }
+}
+
+/// Build a provider authenticated with an explicitly supplied OAuth access
+/// token (a member's Claude subscription or ChatGPT Codex credential) instead
+/// of a global on-disk token or the process-wide env secret — the per-session
+/// OAuth-native sibling of [`create_with_explicit_key`].
+///
+/// Each such provider carries the member's token in an isolated transport: the
+/// Claude subscription token rides a fresh `claude` CLI subprocess (injected as
+/// `CLAUDE_CODE_OAUTH_TOKEN`, letting the real binary own the OAuth + beta
+/// handshake), and the Codex token is held per-provider-instance rather than in
+/// the shared disk `TokenCache`. So one member's credential never leaks into
+/// another member's run.
+///
+/// `provider` is the wire provider name the bridge sends:
+///   - `anthropic` (alias `claude-code`) → Claude subscription via claude-code.
+///   - `openai-codex` (aliases `codex`, `chatgpt_codex`, `openai`) → ChatGPT Codex.
+///
+/// Only providers with an OAuth-native construction path are supported. Anything
+/// else is an error: callers must NOT fall back to `create` (env credentials)
+/// when an OAuth token was supplied, otherwise a request made on behalf of one
+/// credential would silently run on another.
+pub async fn create_with_oauth_token(
+    name: &str,
+    model: ModelConfig,
+    auth_token: String,
+) -> Result<Arc<dyn Provider>> {
+    match name {
+        "anthropic" | "claude-code" => Ok(Arc::new(ClaudeCodeProvider::from_oauth_token(
+            model, auth_token,
+        )?)),
+        "openai-codex" | "codex" | "chatgpt_codex" | "openai" => Ok(Arc::new(
+            ChatGptCodexProvider::from_oauth_token(model, auth_token)?,
+        )),
+        other => Err(anyhow::anyhow!(
+            "Provider '{}' does not support per-run OAuth tokens (supported: anthropic, openai-codex)",
+            other
+        )),
+    }
+}
+
+pub async fn create_with_working_dir(
+    name: &str,
+    model: ModelConfig,
+    extensions: Vec<ExtensionConfig>,
+    working_dir: PathBuf,
+) -> Result<Arc<dyn Provider>> {
+    let entry = get_from_registry(name).await?;
+    entry
+        .create_with_working_dir(model, extensions, working_dir)
+        .await
+}
+
 pub async fn create_with_default_model(
     name: impl AsRef<str>,
     extensions: Vec<ExtensionConfig>,
@@ -200,6 +290,64 @@ mod tests {
     use super::*;
     use crate::config::paths::Paths;
     use std::fs;
+
+    #[tokio::test]
+    async fn create_with_explicit_key_rejects_unsupported_provider() {
+        let err = match create_with_explicit_key(
+            "ollama",
+            ModelConfig::new_or_fail("some-model"),
+            "member-key".to_string(),
+            None,
+        )
+        .await
+        {
+            Ok(_) => {
+                panic!("providers without explicit-key support must be rejected, not env-fallback")
+            }
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("does not support per-run API keys"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_with_oauth_token_rejects_unsupported_provider() {
+        let err = match create_with_oauth_token(
+            "ollama",
+            ModelConfig::new_or_fail("some-model"),
+            "member-oauth-token".to_string(),
+        )
+        .await
+        {
+            Ok(_) => {
+                panic!("providers without oauth-token support must be rejected, not env-fallback")
+            }
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("does not support per-run OAuth tokens"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_with_explicit_key_openai_uses_supplied_host() {
+        let provider = match create_with_explicit_key(
+            "openai",
+            ModelConfig::new_or_fail("gpt-4o"),
+            "member-venice-key".to_string(),
+            Some("https://api.venice.ai/api/v1".to_string()),
+        )
+        .await
+        {
+            Ok(provider) => provider,
+            Err(err) => panic!("openai + api_host should build: {err}"),
+        };
+        assert_eq!(provider.get_name(), "openai");
+    }
 
     #[tokio::test]
     async fn test_tanzu_declarative_provider_registry_wiring() {
@@ -271,6 +419,57 @@ mod tests {
                 .any(|k| k.name == "OPENAI_BASE_PATH"),
             "NVIDIA should not expose OpenAI base path configuration"
         );
+    }
+
+    #[tokio::test]
+    async fn test_nearai_declarative_provider_registry_wiring() {
+        let nearai = get_from_registry("nearai")
+            .await
+            .expect("nearai provider should be registered");
+        let meta = nearai.metadata();
+
+        assert_eq!(nearai.provider_type(), ProviderType::Declarative);
+        assert!(nearai.supports_inventory_refresh());
+        assert_eq!(meta.display_name, "NEAR AI Cloud");
+        assert_eq!(meta.default_model, "zai-org/GLM-5.1-FP8");
+        assert_eq!(meta.model_doc_link, "https://docs.near.ai/");
+        assert!(!meta.setup_steps.is_empty());
+
+        let api_key = meta
+            .config_keys
+            .iter()
+            .find(|k| k.name == "NEARAI_API_KEY")
+            .expect("NEARAI_API_KEY config key should exist");
+        assert!(api_key.required, "NEARAI_API_KEY should be required");
+        assert!(api_key.secret, "NEARAI_API_KEY should be secret");
+        assert!(api_key.primary, "NEARAI_API_KEY should be primary");
+    }
+
+    #[tokio::test]
+    async fn test_alibaba_declarative_provider_registry_wiring() {
+        let alibaba = get_from_registry("alibaba")
+            .await
+            .expect("alibaba provider should be registered");
+        let meta = alibaba.metadata();
+
+        assert_eq!(alibaba.provider_type(), ProviderType::Declarative);
+        assert!(alibaba.supports_inventory_refresh());
+        assert_eq!(meta.display_name, "Alibaba (Qwen)");
+        assert_eq!(meta.default_model, "qwen3.7-max");
+        assert_eq!(
+            meta.model_doc_link,
+            "https://www.alibabacloud.com/help/en/model-studio/models"
+        );
+        assert!(!meta.setup_steps.is_empty());
+
+        let api_key = meta
+            .config_keys
+            .iter()
+            .find(|k| k.name == "DASHSCOPE_API_KEY")
+            .expect("DASHSCOPE_API_KEY config key should exist");
+        assert!(api_key.required, "DASHSCOPE_API_KEY should be required");
+        assert!(api_key.secret, "DASHSCOPE_API_KEY should be secret");
+        assert!(api_key.primary, "DASHSCOPE_API_KEY should be primary");
     }
 
     #[tokio::test]

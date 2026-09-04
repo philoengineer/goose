@@ -390,6 +390,7 @@ fn custom_provider_config_to_dto(
         base_path: config.base_path.clone(),
         api_key_env,
         api_key_set,
+        preserves_thinking: config.preserves_thinking,
     }
 }
 
@@ -434,6 +435,30 @@ impl GooseAcpAgent {
             .internal_err()?;
         Ok(ListProvidersResponse {
             entries: entries.into_iter().map(inventory_entry_to_dto).collect(),
+        })
+    }
+
+    pub(super) async fn on_list_provider_supported_models(
+        &self,
+        req: ProviderSupportedModelsListRequest,
+    ) -> Result<ProviderSupportedModelsListResponse, agent_client_protocol::Error> {
+        let entry = crate::providers::get_from_registry(&req.provider_id)
+            .await
+            .invalid_params_err_ctx("Unknown provider")?;
+        let model_config = crate::model::ModelConfig::new(&entry.metadata().default_model)
+            .invalid_params_err_ctx("Invalid default model")?;
+        let provider = self
+            .create_provider(&req.provider_id, model_config, Vec::new(), None)
+            .await
+            .internal_err_ctx("Failed to initialize provider")?;
+        let models = provider
+            .fetch_supported_models()
+            .await
+            .internal_err_ctx("Failed to fetch provider supported models")?;
+
+        Ok(ProviderSupportedModelsListResponse {
+            provider_id: req.provider_id,
+            models,
         })
     }
 
@@ -513,6 +538,7 @@ impl GooseAcpAgent {
                 requires_auth: provider.requires_auth,
                 catalog_provider_id: provider.catalog_provider_id,
                 base_path: provider.base_path,
+                preserves_thinking: provider.preserves_thinking,
             },
         )
         .internal_err_ctx("Failed to create custom provider")?;
@@ -581,6 +607,7 @@ impl GooseAcpAgent {
                 requires_auth: provider.requires_auth,
                 catalog_provider_id: provider.catalog_provider_id,
                 base_path: provider.base_path,
+                preserves_thinking: provider.preserves_thinking,
             },
         )
         .internal_err_ctx("Failed to update custom provider")?;
@@ -610,12 +637,7 @@ impl GooseAcpAgent {
                 .data(format!("Provider is not editable: {}", req.provider_id)));
         }
 
-        if Config::global()
-            .get_param::<String>("GOOSE_PROVIDER")
-            .ok()
-            .as_deref()
-            == Some(req.provider_id.as_str())
-        {
+        if Config::global().get_goose_provider().ok().as_deref() == Some(req.provider_id.as_str()) {
             return Err(agent_client_protocol::Error::invalid_params().data(format!(
                 "Cannot delete active provider: {}",
                 req.provider_id
@@ -700,7 +722,7 @@ impl GooseAcpAgent {
                     let model_config =
                         crate::model::ModelConfig::new(&metadata.metadata().default_model)?
                             .with_canonical_limits(&provider_id);
-                    provider_factory(provider_id.clone(), model_config, Vec::new()).await
+                    provider_factory(provider_id.clone(), model_config, Vec::new(), None).await
                 })
                 .catch_unwind()
                 .await;

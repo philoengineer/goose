@@ -15,7 +15,7 @@ use crate::providers::formats::openai::create_request;
 use crate::providers::formats::openrouter as openrouter_format;
 use rmcp::model::Tool;
 
-const OPENROUTER_PROVIDER_NAME: &str = "openrouter";
+pub const OPENROUTER_PROVIDER_NAME: &str = "openrouter";
 pub const OPENROUTER_DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4";
 pub const OPENROUTER_DEFAULT_FAST_MODEL: &str = "google/gemini-2.5-flash";
 pub const OPENROUTER_MODEL_PREFIX_ANTHROPIC: &str = "anthropic";
@@ -51,6 +51,38 @@ impl OpenRouterProvider {
 
         let config = crate::config::Config::global();
         let api_key: String = config.get_secret("OPENROUTER_API_KEY")?;
+        let host: String = config
+            .get_param("OPENROUTER_HOST")
+            .unwrap_or_else(|_| "https://openrouter.ai".to_string());
+
+        let auth = AuthMethod::BearerToken(api_key);
+        let api_client = ApiClient::new(host, auth)?
+            .with_header("HTTP-Referer", "https://goose-docs.ai")?
+            .with_header("X-Title", "goose")?;
+
+        Ok(Self {
+            api_client,
+            model,
+            supports_streaming: true,
+            name: OPENROUTER_PROVIDER_NAME.to_string(),
+        })
+    }
+
+    /// Build a provider authenticated with an explicitly supplied API key
+    /// (per-run member credential) instead of the stored `OPENROUTER_API_KEY`
+    /// secret. Mirrors `from_env` minus the secret lookup, so it works even
+    /// when no process-wide key is configured. The key is only held in the
+    /// constructed client and is never persisted.
+    pub fn from_key(model: ModelConfig, api_key: String) -> Result<Self> {
+        if api_key.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "Explicit OpenRouter API key must not be empty"
+            ));
+        }
+
+        let model = model.with_fast(OPENROUTER_DEFAULT_FAST_MODEL, OPENROUTER_PROVIDER_NAME)?;
+
+        let config = crate::config::Config::global();
         let host: String = config
             .get_param("OPENROUTER_HOST")
             .unwrap_or_else(|_| "https://openrouter.ai".to_string());
@@ -278,6 +310,7 @@ impl Provider for OpenRouterProvider {
         if is_gemini_model(&model_config.model_name) {
             openrouter_format::add_reasoning_details_to_request(&mut payload, messages);
         }
+        openrouter_format::apply_reasoning_config(&mut payload, model_config);
 
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("transforms".to_string(), json!(["middle-out"]));
@@ -299,5 +332,37 @@ impl Provider for OpenRouterProvider {
             })?;
 
         stream_openai_compat(response, log)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_key_builds_provider_with_supplied_key() {
+        let provider = OpenRouterProvider::from_key(
+            ModelConfig::new_or_fail("anthropic/claude-test"),
+            "member-supplied-key".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(provider.name, OPENROUTER_PROVIDER_NAME);
+        match provider.api_client.auth() {
+            AuthMethod::BearerToken(key) => assert_eq!(key, "member-supplied-key"),
+            _ => panic!("expected AuthMethod::BearerToken carrying the supplied key"),
+        }
+    }
+
+    #[test]
+    fn from_key_rejects_empty_key() {
+        let err = match OpenRouterProvider::from_key(
+            ModelConfig::new_or_fail("anthropic/claude-test"),
+            String::new(),
+        ) {
+            Ok(_) => panic!("empty explicit key must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("must not be empty"));
     }
 }

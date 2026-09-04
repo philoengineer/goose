@@ -496,6 +496,36 @@ const SETUP_METADATA: &[CuratedSetupMetadata] = &[
         ],
     },
     CuratedSetupMetadata {
+        provider_id: "databricks_v2",
+        category: ProviderSetupCategory::Model,
+        setup_method: ProviderSetupMethod::HostWithOauthFallback,
+        group: ProviderSetupGroup::Additional,
+        display_name: Some("Databricks AI Gateway"),
+        description: Some("Models on Databricks AI Gateway v2"),
+        docs_url: Some("https://docs.databricks.com/en/generative-ai/ai-gateway/"),
+        aliases: &["databricks_ai_gateway"],
+        native_connect_query: None,
+        binary_name: None,
+        setup_capabilities: setup_capabilities(false, true, false),
+        show_only_when_installed: false,
+        synthetic: false,
+        secret_field_default: None,
+        field_overrides: &[
+            CuratedFieldMetadata {
+                key: "DATABRICKS_HOST",
+                label: "Host URL",
+                placeholder: Some("https://dbc-...cloud.databricks.com"),
+                default_value: None,
+            },
+            CuratedFieldMetadata {
+                key: "DATABRICKS_TOKEN",
+                label: "Access Token",
+                placeholder: Some("Paste your access token"),
+                default_value: None,
+            },
+        ],
+    },
+    CuratedSetupMetadata {
         provider_id: "github_copilot",
         category: ProviderSetupCategory::Model,
         setup_method: ProviderSetupMethod::OauthDeviceCode,
@@ -521,6 +551,23 @@ const SETUP_METADATA: &[CuratedSetupMetadata] = &[
         description: Some("DeepSeek chat and reasoning models"),
         docs_url: Some("https://platform.deepseek.com/api_keys"),
         aliases: &[],
+        native_connect_query: None,
+        binary_name: None,
+        setup_capabilities: setup_capabilities(false, false, false),
+        show_only_when_installed: false,
+        synthetic: false,
+        secret_field_default: Some(API_KEY_FIELD),
+        field_overrides: &[],
+    },
+    CuratedSetupMetadata {
+        provider_id: "zai",
+        category: ProviderSetupCategory::Model,
+        setup_method: ProviderSetupMethod::SingleApiKey,
+        group: ProviderSetupGroup::Additional,
+        display_name: None,
+        description: Some("GLM models via Z.AI"),
+        docs_url: Some("https://docs.z.ai/devpack/tool/goose"),
+        aliases: &["z.ai", "zhipu"],
         native_connect_query: None,
         binary_name: None,
         setup_capabilities: setup_capabilities(false, false, false),
@@ -701,6 +748,28 @@ const SETUP_METADATA: &[CuratedSetupMetadata] = &[
             label: "Host URL",
             placeholder: Some("http://localhost:1234/v1/chat/completions"),
             default_value: None,
+        }],
+    },
+    CuratedSetupMetadata {
+        provider_id: "atomic_chat",
+        category: ProviderSetupCategory::Model,
+        setup_method: ProviderSetupMethod::ConfigFields,
+        group: ProviderSetupGroup::Additional,
+        display_name: None,
+        description: None,
+        docs_url: Some("https://github.com/AtomicBot-ai/Atomic-Chat?tab=readme-ov-file#readme"),
+        aliases: &[],
+        native_connect_query: None,
+        binary_name: None,
+        setup_capabilities: setup_capabilities(false, false, false),
+        show_only_when_installed: false,
+        synthetic: false,
+        secret_field_default: None,
+        field_overrides: &[CuratedFieldMetadata {
+            key: "ATOMIC_CHAT_HOST",
+            label: "Host URL",
+            placeholder: Some("http://localhost:1337"),
+            default_value: Some("http://localhost:1337"),
         }],
     },
     CuratedSetupMetadata {
@@ -1023,16 +1092,35 @@ pub fn get_provider_template(provider_id: &str) -> Option<ProviderTemplate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::base::ProviderType;
 
     #[tokio::test]
     async fn test_zai_provider() {
-        let openai_providers = get_providers_by_format(ProviderFormat::OpenAI).await;
-        let zai = openai_providers.iter().find(|p| p.id == "zai");
-        assert!(zai.is_some(), "z.ai should be in catalog");
+        let zai = crate::providers::get_from_registry("zai")
+            .await
+            .expect("z.ai should be registered as a declarative provider");
+        assert_eq!(zai.provider_type(), ProviderType::Declarative);
 
-        let zai = zai.unwrap();
-        println!("Z.AI: {} models", zai.model_count);
-        assert!(zai.model_count > 0, "z.ai should have models");
+        let metadata = zai.metadata();
+        assert_eq!(metadata.display_name, "Z.AI");
+        assert!(
+            !metadata.known_models.is_empty(),
+            "z.ai should have known models"
+        );
+        assert!(
+            metadata
+                .config_keys
+                .iter()
+                .any(|key| key.name == "ZHIPU_API_KEY"),
+            "z.ai should expose its API key config"
+        );
+
+        let setup_entries = get_setup_catalog_entries().await;
+        let setup_entry = setup_entries
+            .iter()
+            .find(|entry| entry.provider_id == "zai")
+            .expect("z.ai should be in the setup catalog");
+        assert_eq!(setup_entry.setup_method, ProviderSetupMethod::SingleApiKey);
 
         let template = get_provider_template("zai");
         assert!(template.is_some(), "z.ai should have a template");
@@ -1093,6 +1181,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["DATABRICKS_HOST", "DATABRICKS_TOKEN"]
         );
+
+        let atomic_chat = entries
+            .iter()
+            .find(|entry| entry.provider_id == "atomic_chat")
+            .expect("setup catalog should include atomic_chat declarative provider");
+        assert_eq!(atomic_chat.setup_method, ProviderSetupMethod::ConfigFields);
+        let host_field = atomic_chat
+            .fields
+            .iter()
+            .find(|field| field.key == "ATOMIC_CHAT_HOST")
+            .expect("atomic_chat should expose ATOMIC_CHAT_HOST");
+        assert_eq!(host_field.label, "Host URL");
+        assert_eq!(
+            host_field.default_value.as_deref(),
+            Some("http://localhost:1337")
+        );
     }
 
     #[tokio::test]
@@ -1105,6 +1209,7 @@ mod tests {
 
         assert!(provider_ids.contains("claude-acp"));
         assert!(provider_ids.contains("codex-acp"));
+        assert!(provider_ids.contains("atomic_chat"));
         assert!(!provider_ids.contains("claude_code"));
         assert!(!provider_ids.contains("codex"));
         assert!(!provider_ids.contains("gemini_cli"));

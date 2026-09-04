@@ -45,7 +45,7 @@ const OAUTH_TIMEOUT_SECS: u64 = 300;
 const HTML_AUTO_CLOSE_TIMEOUT_MS: u64 = 2000;
 
 const CHATGPT_CODEX_PROVIDER_NAME: &str = "chatgpt_codex";
-pub const CHATGPT_CODEX_DEFAULT_MODEL: &str = "gpt-5.3-codex";
+pub const CHATGPT_CODEX_DEFAULT_MODEL: &str = "gpt-5.5";
 
 #[derive(Debug)]
 pub struct ChatGptCodexModelAttrs {
@@ -54,6 +54,10 @@ pub struct ChatGptCodexModelAttrs {
 }
 
 pub const CHATGPT_CODEX_KNOWN_MODELS: &[ChatGptCodexModelAttrs] = &[
+    ChatGptCodexModelAttrs {
+        name: "gpt-5.5",
+        reasoning_levels: &["low", "medium", "high", "xhigh"],
+    },
     ChatGptCodexModelAttrs {
         name: "gpt-5.4",
         reasoning_levels: &["low", "medium", "high", "xhigh"],
@@ -225,6 +229,29 @@ fn get_reasoning_effort(model_name: &str) -> String {
     }
 }
 
+fn reasoning_effort_for_config(model_config: &ModelConfig) -> Option<String> {
+    use crate::model::ThinkingEffort;
+
+    model_config
+        .thinking_effort()
+        .map(|effort| {
+            let valid_levels = reasoning_levels_for_model(&model_config.model_name);
+            let preferred_levels: &[&str] = match effort {
+                ThinkingEffort::Off => return None,
+                ThinkingEffort::Low => &["low", "medium", "high", "xhigh"],
+                ThinkingEffort::Medium => &["medium", "high", "low", "xhigh"],
+                ThinkingEffort::High => &["high", "medium", "xhigh", "low"],
+                ThinkingEffort::Max => &["xhigh", "high", "medium", "low"],
+            };
+
+            preferred_levels
+                .iter()
+                .find(|level| valid_levels.contains(level))
+                .map(|level| (*level).to_string())
+        })
+        .unwrap_or_else(|| Some(get_reasoning_effort(&model_config.model_name)))
+}
+
 fn create_codex_request(
     model_config: &ModelConfig,
     system: &str,
@@ -232,7 +259,7 @@ fn create_codex_request(
     tools: &[Tool],
 ) -> Result<Value> {
     let input_items = build_input_items(messages)?;
-    let reasoning_effort = get_reasoning_effort(&model_config.model_name);
+    let reasoning_effort = reasoning_effort_for_config(model_config);
 
     let instructions = match model_config.model_name.as_str() {
         "gpt-5.3-codex" => format!("{GPT_53_CODEX_TOOL_PREAMBLE}\n\n{system}"),
@@ -243,7 +270,6 @@ fn create_codex_request(
         "model": model_config.model_name,
         "input": input_items,
         "store": false,
-        "reasoning": {"effort": reasoning_effort},
         "instructions": instructions,
     });
 
@@ -271,6 +297,13 @@ fn create_codex_request(
 
     if let Some(temp) = model_config.temperature {
         payload_obj.insert("temperature".to_string(), json!(temp));
+    }
+
+    if let Some(reasoning_effort) = reasoning_effort {
+        payload_obj.insert(
+            "reasoning".to_string(),
+            json!({ "effort": reasoning_effort }),
+        );
     }
 
     Ok(payload)
@@ -591,7 +624,7 @@ fn html_success() -> String {
 }
 
 fn html_error(error: &str) -> String {
-    let safe_error = v_htmlescape::escape(error).to_string();
+    let safe_error = v_htmlescape::escape_fmt(error);
     format!(
         r#"<!doctype html>
 <html>
@@ -843,13 +876,35 @@ impl AuthProvider for ChatGptCodexAuthProvider {
     }
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(serde::Serialize)]
 pub struct ChatGptCodexProvider {
     #[serde(skip)]
     auth_provider: Arc<ChatGptCodexAuthProvider>,
     model: ModelConfig,
     #[serde(skip)]
     name: String,
+    /// Per-session member OAuth token (a member's ChatGPT Codex subscription
+    /// credential). When set, requests authenticate with this token directly
+    /// instead of the process-global on-disk `TokenCache`, isolating one
+    /// member's credential from another's in a shared container. Never
+    /// serialized, never persisted, and redacted from Debug output.
+    #[serde(skip)]
+    session_token: Option<TokenData>,
+}
+
+// Manual Debug so the per-session member token is never rendered into logs or
+// error chains (the derived Debug would print the access/refresh tokens).
+impl std::fmt::Debug for ChatGptCodexProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatGptCodexProvider")
+            .field("model", &self.model)
+            .field("name", &self.name)
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl ChatGptCodexProvider {
@@ -867,6 +922,46 @@ impl ChatGptCodexProvider {
             auth_provider,
             model,
             name: CHATGPT_CODEX_PROVIDER_NAME.to_string(),
+            session_token: None,
+        })
+    }
+
+    /// Build a codex provider that authenticates with a per-session member OAuth
+    /// access token (a member's ChatGPT Codex subscription) instead of the
+    /// process-global on-disk `TokenCache`. The `chatgpt-account-id` is derived
+    /// from the token's own JWT claims. Session tokens are never refreshed here —
+    /// the bridge re-supplies a fresh token on each `update_provider`.
+    pub fn from_oauth_token(model: ModelConfig, access_token: String) -> Result<Self> {
+        if access_token.trim().is_empty() {
+            return Err(anyhow!(
+                "Explicit ChatGPT Codex OAuth token must not be empty"
+            ));
+        }
+
+        let account_id = parse_jwt_claims_unverified(&access_token)
+            .as_ref()
+            .and_then(account_id_from_claims);
+
+        let session_token = TokenData {
+            access_token,
+            // Unused: session tokens are supplied per-run and never refreshed here.
+            refresh_token: String::new(),
+            id_token: None,
+            // A far-future expiry keeps any incidental validity check from forcing
+            // the disk-cache refresh path we deliberately bypass for session tokens.
+            expires_at: Utc::now() + chrono::Duration::days(365),
+            account_id,
+        };
+
+        let auth_provider = Arc::new(ChatGptCodexAuthProvider::new(
+            ChatGptCodexAuthState::instance(),
+        ));
+
+        Ok(Self {
+            auth_provider,
+            model,
+            name: CHATGPT_CODEX_PROVIDER_NAME.to_string(),
+            session_token: Some(session_token),
         })
     }
 
@@ -875,11 +970,16 @@ impl ChatGptCodexProvider {
         session_id: Option<&str>,
         payload: &Value,
     ) -> Result<reqwest::Response, ProviderError> {
-        let token_data = self
-            .auth_provider
-            .get_valid_token()
-            .await
-            .map_err(|e| ProviderError::Authentication(e.to_string()))?;
+        // Prefer a per-session member token when present; otherwise fall back to
+        // the process-global on-disk credential (env/global-OAuth behaviour).
+        let token_data = match &self.session_token {
+            Some(token) => token.clone(),
+            None => self
+                .auth_provider
+                .get_valid_token()
+                .await
+                .map_err(|e| ProviderError::Authentication(e.to_string()))?,
+        };
 
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(account_id) = &token_data.account_id {
@@ -1173,6 +1273,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_create_codex_request_reasoning_effort_from_unified_thinking() {
+        let mut params = std::collections::HashMap::new();
+        params.insert("thinking_effort".to_string(), json!("max"));
+        let mut config = ModelConfig::new("gpt-5.3-codex").unwrap();
+        config.request_params = Some(params);
+
+        let payload = create_codex_request(&config, "sys", &[], &[]).unwrap();
+        assert_eq!(payload["reasoning"]["effort"], "xhigh");
+        assert!(payload.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_create_codex_request_caps_unified_thinking_to_supported_level() {
+        let mut params = std::collections::HashMap::new();
+        params.insert("thinking_effort".to_string(), json!("max"));
+        let mut config = ModelConfig::new("unknown-model").unwrap();
+        config.request_params = Some(params);
+
+        let payload = create_codex_request(&config, "sys", &[], &[]).unwrap();
+        assert_eq!(payload["reasoning"]["effort"], "high");
+        assert!(payload.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_create_codex_request_off_omits_reasoning_for_codex_models() {
+        let mut params = std::collections::HashMap::new();
+        params.insert("thinking_effort".to_string(), json!("off"));
+        let mut config = ModelConfig::new("gpt-5.2-codex").unwrap();
+        config.request_params = Some(params);
+
+        let payload = create_codex_request(&config, "sys", &[], &[]).unwrap();
+        assert!(payload.get("reasoning").is_none());
+        assert!(payload.get("reasoning_effort").is_none());
+    }
+
     #[test_case(
         JwtClaims {
             chatgpt_account_id: Some("account-1".to_string()),
@@ -1329,6 +1465,65 @@ mod tests {
     #[test_case("unknown-model", &["medium", "high"]; "unknown model gets default reasoning levels")]
     fn test_reasoning_levels_for_model(model: &str, expected: &[&str]) {
         assert_eq!(reasoning_levels_for_model(model), expected);
+    }
+
+    /// Build an unsigned JWT (`header.payload.sig`) whose payload is `claims`.
+    /// `parse_jwt_claims_unverified` only reads the base64 payload segment, so no
+    /// real signature (and no crypto provider) is needed.
+    fn make_unsigned_jwt(claims: &Value) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
+        format!("{header}.{payload}.sig")
+    }
+
+    #[test]
+    fn from_oauth_token_rejects_empty_token() {
+        let err = ChatGptCodexProvider::from_oauth_token(
+            ModelConfig::new_or_fail(CHATGPT_CODEX_DEFAULT_MODEL),
+            "   ".to_string(),
+        )
+        .expect_err("empty oauth token must be rejected");
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn from_oauth_token_stores_session_token_and_derives_account_id() {
+        let token = make_unsigned_jwt(&json!({
+            "exp": (Utc::now() + chrono::Duration::hours(1)).timestamp(),
+            "chatgpt_account_id": "acct-xyz",
+        }));
+
+        let provider = ChatGptCodexProvider::from_oauth_token(
+            ModelConfig::new_or_fail(CHATGPT_CODEX_DEFAULT_MODEL),
+            token.clone(),
+        )
+        .unwrap();
+
+        let session = provider
+            .session_token
+            .as_ref()
+            .expect("per-session token must be stored, not the disk cache");
+        assert_eq!(session.access_token, token);
+        assert_eq!(session.account_id.as_deref(), Some("acct-xyz"));
+
+        // Debug must never leak the member token.
+        let rendered = format!("{provider:?}");
+        assert!(
+            !rendered.contains(&token),
+            "Debug output must not leak the session token: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"));
+    }
+
+    #[tokio::test]
+    async fn from_env_has_no_session_token() {
+        // from_env is the process-global path; it must not carry a per-session token.
+        let provider =
+            ChatGptCodexProvider::from_env(ModelConfig::new_or_fail(CHATGPT_CODEX_DEFAULT_MODEL))
+                .await
+                .unwrap();
+        assert!(provider.session_token.is_none());
     }
 
     #[test]

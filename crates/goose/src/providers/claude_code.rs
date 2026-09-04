@@ -256,7 +256,7 @@ impl Drop for CliProcess {
 /// across turns, maintaining conversation state internally. Messages are sent as
 /// NDJSON on stdin with content arrays supporting text and image blocks. Responses
 /// are NDJSON on stdout (`assistant` + `result` events per turn).
-#[derive(Debug, serde::Serialize)]
+#[derive(serde::Serialize)]
 pub struct ClaudeCodeProvider {
     command: PathBuf,
     model: ModelConfig,
@@ -265,6 +265,13 @@ pub struct ClaudeCodeProvider {
     /// Temp file holding MCP config JSON (auto-deleted on drop).
     #[serde(skip)]
     mcp_config_file: Option<NamedTempFile>,
+    /// Per-session member OAuth token (the member's Claude subscription
+    /// credential). When set, it is injected into every spawned `claude`
+    /// subprocess as `CLAUDE_CODE_OAUTH_TOKEN`, so one member's credential
+    /// never leaks into another member's run or picks up the box's own token.
+    /// Never serialized, never persisted, and redacted from Debug output.
+    #[serde(skip)]
+    oauth_token: Option<String>,
     #[serde(skip)]
     cli_process: tokio::sync::OnceCell<Arc<tokio::sync::Mutex<CliProcess>>>,
     #[serde(skip)]
@@ -272,6 +279,22 @@ pub struct ClaudeCodeProvider {
         Arc<tokio::sync::Mutex<HashMap<String, oneshot::Sender<PermissionConfirmation>>>>,
     #[serde(skip)]
     initial_mode: tokio::sync::Mutex<Option<GooseMode>>,
+}
+
+// Manual Debug so the per-session `oauth_token` secret is never rendered into
+// logs or error chains (the derived Debug would print it verbatim).
+impl std::fmt::Debug for ClaudeCodeProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaudeCodeProvider")
+            .field("command", &self.command)
+            .field("model", &self.model)
+            .field("name", &self.name)
+            .field(
+                "oauth_token",
+                &self.oauth_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl ClaudeCodeProvider {
@@ -330,11 +353,47 @@ impl ClaudeCodeProvider {
         blocks
     }
 
+    /// Build a claude-code provider that authenticates each spawned `claude`
+    /// subprocess with a per-session OAuth token (a member's Claude subscription
+    /// credential) instead of whatever `CLAUDE_CODE_OAUTH_TOKEN` the box process
+    /// happens to carry. No MCP/extension config is wired: this is the per-run
+    /// member-credential transport used by `create_with_oauth_token`, letting the
+    /// genuine `claude` binary own the OAuth + beta handshake.
+    pub fn from_oauth_token(model: ModelConfig, oauth_token: String) -> Result<Self> {
+        if oauth_token.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "Explicit Claude OAuth token must not be empty"
+            ));
+        }
+
+        let config = crate::config::Config::global();
+        let command: String = config.get_claude_code_command().unwrap_or_default().into();
+        let resolved_command = SearchPaths::builder().with_npm().resolve(command)?;
+
+        Ok(Self {
+            command: resolved_command,
+            model,
+            name: CLAUDE_CODE_PROVIDER_NAME.to_string(),
+            mcp_config_file: None,
+            oauth_token: Some(oauth_token),
+            cli_process: tokio::sync::OnceCell::new(),
+            pending_confirmations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            initial_mode: tokio::sync::Mutex::new(None),
+        })
+    }
+
     fn build_stream_json_command(&self) -> Command {
         let mut cmd = Command::new(&self.command);
         configure_subprocess(&mut cmd);
         // Allow goose to run inside a Claude Code session.
         cmd.env_remove("CLAUDECODE");
+        // Per-session member credential: authenticate this subprocess with the
+        // member's Claude subscription OAuth token. Each run spawns a fresh
+        // subprocess, so setting the env here (overriding any inherited box
+        // token) isolates one member's credential from another's.
+        if let Some(token) = &self.oauth_token {
+            cmd.env("CLAUDE_CODE_OAUTH_TOKEN", token);
+        }
         cmd.arg("--input-format")
             .arg("stream-json")
             .arg("--output-format")
@@ -623,6 +682,7 @@ impl ProviderDef for ClaudeCodeProvider {
                 model,
                 name: CLAUDE_CODE_PROVIDER_NAME.to_string(),
                 mcp_config_file,
+                oauth_token: None,
                 cli_process: tokio::sync::OnceCell::new(),
                 pending_confirmations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 initial_mode: tokio::sync::Mutex::new(None),
@@ -1210,6 +1270,10 @@ mod tests {
     }
 
     fn make_provider() -> ClaudeCodeProvider {
+        make_provider_with_token(None)
+    }
+
+    fn make_provider_with_token(oauth_token: Option<String>) -> ClaudeCodeProvider {
         ClaudeCodeProvider {
             command: PathBuf::from("claude"),
             model: ModelConfig::new(CLAUDE_CODE_DEFAULT_MODEL)
@@ -1217,10 +1281,69 @@ mod tests {
                 .with_canonical_limits(CLAUDE_CODE_PROVIDER_NAME),
             name: "claude-code".to_string(),
             mcp_config_file: None,
+            oauth_token,
             cli_process: tokio::sync::OnceCell::new(),
             pending_confirmations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             initial_mode: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Collect the environment overrides explicitly set on a spawned command
+    /// (this reflects `.env()`/`.env_remove()` calls, not inherited parent env).
+    fn command_env(cmd: &Command) -> HashMap<String, Option<String>> {
+        cmd.as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn oauth_token_injected_into_subprocess_env() {
+        let provider = make_provider_with_token(Some("member-oauth-token".to_string()));
+        let cmd = provider.build_stream_json_command();
+        let env = command_env(&cmd);
+        assert_eq!(
+            env.get("CLAUDE_CODE_OAUTH_TOKEN"),
+            Some(&Some("member-oauth-token".to_string())),
+            "member OAuth token must be set in the claude subprocess env"
+        );
+    }
+
+    #[test]
+    fn no_oauth_token_leaves_subprocess_env_unset() {
+        let provider = make_provider_with_token(None);
+        let cmd = provider.build_stream_json_command();
+        let env = command_env(&cmd);
+        assert!(
+            !env.contains_key("CLAUDE_CODE_OAUTH_TOKEN"),
+            "without a member token the subprocess must not have the token set explicitly"
+        );
+    }
+
+    #[test]
+    fn from_oauth_token_rejects_empty_token() {
+        let err = ClaudeCodeProvider::from_oauth_token(
+            ModelConfig::new_or_fail(CLAUDE_CODE_DEFAULT_MODEL),
+            "   ".to_string(),
+        )
+        .expect_err("empty oauth token must be rejected");
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn debug_redacts_oauth_token() {
+        let provider = make_provider_with_token(Some("super-secret-token".to_string()));
+        let rendered = format!("{provider:?}");
+        assert!(
+            !rendered.contains("super-secret-token"),
+            "Debug output must not leak the oauth token: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"));
     }
 
     fn make_test_process(canned_stdout: &str) -> (CliProcess, tokio::io::DuplexStream) {

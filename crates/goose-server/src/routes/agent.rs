@@ -1,3 +1,4 @@
+use crate::routes::config_management::resolve_provider_model_info;
 use crate::routes::errors::ErrorResponse;
 use crate::routes::recipe_utils::{
     apply_recipe_to_agent, build_recipe_with_parameter_values, load_recipe_by_id, validate_recipe,
@@ -23,7 +24,7 @@ use goose::providers::create;
 use goose::recipe::Recipe;
 use goose::recipe_deeplink;
 use goose::session::session_manager::SessionType;
-use goose::session::{EnabledExtensionsState, ExtensionState, Session};
+use goose::session::{EnabledExtensionsState, ExtensionState, Session, SessionMemberState};
 use goose::{
     agents::{extension::ToolInfo, extension_manager::get_parameter_names},
     config::permission::PermissionLevel,
@@ -49,6 +50,32 @@ pub struct UpdateProviderRequest {
     session_id: String,
     context_limit: Option<usize>,
     request_params: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Per-run member credential. When set, the provider is constructed with
+    /// this key instead of the process-wide env/config secret, and the session
+    /// is marked `external_credential` so restores fail closed. The key itself
+    /// is NEVER persisted — callers must re-supply it on each update_provider.
+    #[serde(default)]
+    api_key: Option<String>,
+    /// Per-run OpenAI-compatible endpoint host (e.g. a member's own Venice
+    /// base URL). Only honored for `provider == "openai"` alongside `api_key`;
+    /// points the client at this host instead of the process-global OpenAI
+    /// endpoint. Never persisted.
+    #[serde(default)]
+    api_host: Option<String>,
+    /// Per-run member OAuth access token, present iff the credential is
+    /// OAuth-native (a member's Claude subscription `CLAUDE_CODE_OAUTH_TOKEN`
+    /// or ChatGPT Codex token). When set, the provider is built on this token
+    /// instead of the process-wide secret, and the session is marked
+    /// `external_credential` so restores fail closed. Never persisted — callers
+    /// must re-supply it on each `update_provider`.
+    #[serde(default)]
+    auth_token: Option<String>,
+    /// Which kind of per-run credential accompanies this request: `"oauth"`
+    /// (use `auth_token`) or `"api-key"` (use `api_key`). `#[serde(default)]`
+    /// keeps pre-OAuth request bodies (api-key only, no `credential_kind`)
+    /// deserializing, so the field is deploy-order-safe.
+    #[serde(default)]
+    credential_kind: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -74,6 +101,11 @@ pub struct StartAgentRequest {
     recipe_deeplink: Option<String>,
     #[serde(default)]
     extension_overrides: Option<Vec<ExtensionConfig>>,
+    /// Fabrica T-BYOM (2026-08-19): the member this session belongs to.
+    /// Additive + serde(default) → deploy-order-safe; shape-guarded before
+    /// storage (SessionMemberState::sanitize). See extension_data.rs.
+    #[serde(default)]
+    session_member: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -96,18 +128,6 @@ pub struct UpdateWorkingDirRequest {
 pub struct ResumeAgentRequest {
     session_id: String,
     load_model_and_extensions: bool,
-}
-
-#[derive(Deserialize, utoipa::ToSchema)]
-pub struct AddExtensionRequest {
-    session_id: String,
-    config: ExtensionConfig,
-}
-
-#[derive(Deserialize, utoipa::ToSchema)]
-pub struct RemoveExtensionRequest {
-    name: String,
-    session_id: String,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -195,6 +215,7 @@ pub struct RestartAgentResponse {
 #[allow(clippy::too_many_lines)]
 async fn start_agent(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(payload): Json<StartAgentRequest>,
 ) -> Result<Json<Session>, ErrorResponse> {
     #[cfg(feature = "telemetry")]
@@ -206,7 +227,20 @@ async fn start_agent(
         recipe_id,
         recipe_deeplink,
         extension_overrides,
+        session_member,
     } = payload;
+
+    // Fabrica T-BYOM (2026-08-19): the edge-authed X-Member header outranks
+    // the body field. On the SPA lane Caddy's forward_auth STAMPS X-Member
+    // from the verified session (a browser can forge the body field but
+    // never that header); the bridge's server-driven lane has no Caddy in
+    // front and sends session_member in the body. Both are shape-guarded
+    // again at storage (SessionMemberState::sanitize).
+    let session_member = headers
+        .get("x-member")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .or(session_member);
 
     let original_recipe = if let Some(deeplink) = recipe_deeplink {
         match recipe_deeplink::decode(&deeplink) {
@@ -270,6 +304,15 @@ async fn start_agent(
         resolve_extensions_for_new_session(recipe_extensions, extension_overrides);
 
     let mut extension_data = session.extension_data.clone();
+    // Fabrica T-BYOM (2026-08-19): persist the session's member (shape-guarded)
+    // so stdio-extension spawns can inject GOOSE_SESSION_MEMBER (see
+    // extension_manager.rs) and member-aware extensions bill the member,
+    // not the box. Invalid/absent → memberless session, byte-identical.
+    if let Some(member) = session_member.as_deref().and_then(SessionMemberState::sanitize) {
+        if let Err(e) = (SessionMemberState { member }).to_extension_data(&mut extension_data) {
+            tracing::warn!("Failed to store session member: {}", e);
+        }
+    }
     let extensions_state = EnabledExtensionsState::new(extensions_to_use);
     if let Err(e) = extensions_state.to_extension_data(&mut extension_data) {
         tracing::warn!("Failed to initialize session with extensions: {}", e);
@@ -566,6 +609,17 @@ async fn get_tools(
     Ok(Json(tools))
 }
 
+/// Which per-run credential (if any) an `update_provider` request carries, after
+/// reconciling `credential_kind` with the supplied `api_key`/`auth_token` fields.
+enum MemberCredential {
+    /// OAuth-native member token (Claude subscription / ChatGPT Codex).
+    OAuth(String),
+    /// Explicit API key, optionally with an OpenAI-compatible host override.
+    ApiKey(String, Option<String>),
+    /// No per-run credential: build from the process env/config secret.
+    Env,
+}
+
 #[utoipa::path(
     post,
     path = "/agent/update_provider",
@@ -595,7 +649,7 @@ async fn update_agent_provider(
         }
     };
 
-    let model_config = ModelConfig::new(&model)
+    let mut model_config = ModelConfig::new(&model)
         .map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
@@ -603,19 +657,134 @@ async fn update_agent_provider(
             )
         })?
         .with_canonical_limits(&payload.provider)
-        .with_context_limit(payload.context_limit)
-        .with_request_params(payload.request_params);
+        .with_context_limit(payload.context_limit);
+
+    if let Some(request_params) = payload.request_params {
+        model_config = model_config.with_merged_request_params(request_params);
+    }
+    // Per-run credential (BYOM 2026-09-04): the member's own key/token may be
+    // for a provider this goosed has NO global credential for (openrouter /
+    // venice / openai on a box that only carries ANTHROPIC_API_KEY).
+    // resolve_provider_model_info gates on the GLOBAL config and builds the
+    // provider from env, so for an external credential it is advisory only:
+    // use the model info when it resolves, otherwise leave `reasoning` unset
+    // rather than 400 "Provider 'x' is not configured" — the credential
+    // branch below builds the provider from the supplied key regardless.
+    let has_external_credential = payload.api_key.is_some() || payload.auth_token.is_some();
+    if has_external_credential {
+        if let Ok(model_info) = resolve_provider_model_info(&payload.provider, &model).await {
+            model_config.reasoning = Some(model_info.reasoning);
+        }
+    } else {
+        let model_info = resolve_provider_model_info(&payload.provider, &model)
+            .await
+            .map_err(|e| (e.status, e.message))?;
+        model_config.reasoning = Some(model_info.reasoning);
+    }
 
     let extensions =
         EnabledExtensionsState::for_session(state.session_manager(), &payload.session_id, config)
             .await;
 
-    let new_provider = create(&payload.provider, model_config, extensions)
+    // Resolve the credential mode. With any per-run credential the provider MUST
+    // be built from it (never a silent from_env fallback that would run one
+    // member's request on another's credential); an unsupported provider is a
+    // hard 400. `credential_kind` is authoritative when present; otherwise we
+    // fall back to which secret field was supplied, so a pre-OAuth bridge that
+    // only ever sends `api_key` keeps working (deploy-order-safe).
+    let external_credential = payload.api_key.is_some() || payload.auth_token.is_some();
+    let api_host = payload.api_host;
+    let credential = match payload.credential_kind.as_deref() {
+        Some("oauth") => {
+            let token = payload.auth_token.ok_or((
+                StatusCode::BAD_REQUEST,
+                "credential_kind 'oauth' requires auth_token".to_owned(),
+            ))?;
+            MemberCredential::OAuth(token)
+        }
+        Some("api-key") => {
+            let api_key = payload.api_key.ok_or((
+                StatusCode::BAD_REQUEST,
+                "credential_kind 'api-key' requires api_key".to_owned(),
+            ))?;
+            MemberCredential::ApiKey(api_key, api_host)
+        }
+        _ => match (payload.auth_token, payload.api_key) {
+            (Some(token), _) => MemberCredential::OAuth(token),
+            (None, Some(api_key)) => MemberCredential::ApiKey(api_key, api_host),
+            (None, None) => MemberCredential::Env,
+        },
+    };
+
+    let new_provider = match credential {
+        MemberCredential::OAuth(auth_token) => {
+            if auth_token.trim().is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "auth_token must not be empty when provided".to_owned(),
+                ));
+            }
+            goose::providers::create_with_oauth_token(&payload.provider, model_config, auth_token)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "Failed to create {} provider with oauth auth_token: {}",
+                            &payload.provider, e
+                        ),
+                    )
+                })?
+        }
+        MemberCredential::ApiKey(api_key, api_host) => {
+            if api_key.trim().is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "api_key must not be empty when provided".to_owned(),
+                ));
+            }
+            goose::providers::create_with_explicit_key(
+                &payload.provider,
+                model_config,
+                api_key,
+                api_host,
+            )
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Failed to create {} provider with explicit api_key: {}",
+                        &payload.provider, e
+                    ),
+                )
+            })?
+        }
+        MemberCredential::Env => create(&payload.provider, model_config, extensions)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to create {} provider: {}", &payload.provider, e),
+                )
+            })?,
+    };
+
+    // Record (only) whether the session runs on an external per-run credential
+    // so provider restoration fails closed instead of reaching for env keys.
+    // The key itself is never written anywhere. Persisted BEFORE the provider
+    // swap: if we crash in between, an externally-credentialed session is
+    // already marked (fail closed) rather than left restorable from env keys.
+    state
+        .session_manager()
+        .update(&payload.session_id)
+        .external_credential(external_credential)
+        .apply()
         .await
         .map_err(|e| {
             (
-                StatusCode::BAD_REQUEST,
-                format!("Failed to create {} provider: {}", &payload.provider, e),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to persist credential marker: {}", e),
             )
         })?;
 
@@ -683,70 +852,6 @@ async fn update_session(
     }
 
     Ok(())
-}
-
-#[utoipa::path(
-    post,
-    path = "/agent/add_extension",
-    request_body = AddExtensionRequest,
-    responses(
-        (status = 200, description = "Extension added", body = String),
-        (status = 401, description = "Unauthorized - invalid secret key"),
-        (status = 424, description = "Agent not initialized"),
-        (status = 500, description = "Internal server error")
-    )
-)]
-async fn agent_add_extension(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<AddExtensionRequest>,
-) -> Result<StatusCode, ErrorResponse> {
-    let extension_name = request.config.name();
-    let agent = state.get_agent(request.session_id.clone()).await?;
-
-    agent
-        .add_extension(request.config, &request.session_id)
-        .await
-        .map_err(|e| {
-            #[cfg(feature = "telemetry")]
-            goose::posthog::emit_error(
-                "extension_add_failed",
-                &format!("{}: {}", extension_name, e),
-            );
-            ErrorResponse::internal(format!("Failed to add extension: {}", e))
-        })?;
-
-    Ok(StatusCode::OK)
-}
-
-#[utoipa::path(
-    post,
-    path = "/agent/remove_extension",
-    request_body = RemoveExtensionRequest,
-    responses(
-        (status = 200, description = "Extension removed", body = String),
-        (status = 401, description = "Unauthorized - invalid secret key"),
-        (status = 424, description = "Agent not initialized"),
-        (status = 500, description = "Internal server error")
-    )
-)]
-async fn agent_remove_extension(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<RemoveExtensionRequest>,
-) -> Result<StatusCode, ErrorResponse> {
-    let agent = state.get_agent(request.session_id.clone()).await?;
-
-    agent
-        .remove_extension(&request.name, &request.session_id)
-        .await
-        .map_err(|e| {
-            error!("Failed to remove extension: {}", e);
-            ErrorResponse {
-                message: format!("Failed to remove extension: {}", e),
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-            }
-        })?;
-
-    Ok(StatusCode::OK)
 }
 
 #[utoipa::path(
@@ -1348,8 +1453,6 @@ pub fn routes(state: Arc<AppState>) -> Router {
         .route("/agent/update_provider", post(update_agent_provider))
         .route("/agent/update_session", post(update_session))
         .route("/agent/update_from_session", post(update_from_session))
-        .route("/agent/add_extension", post(agent_add_extension))
-        .route("/agent/remove_extension", post(agent_remove_extension))
         .route("/agent/set_container", post(set_container))
         .route("/agent/stop", post(stop_agent))
         .with_state(state)
@@ -1362,6 +1465,65 @@ mod tests {
     use goose::session::session_manager::SessionType;
     use rmcp::model::Tool;
     use rmcp::object;
+
+    #[test]
+    fn update_provider_request_deserializes_without_api_key() {
+        let req: UpdateProviderRequest = serde_json::from_str(
+            r#"{"provider":"anthropic","model":"claude-test","session_id":"s1"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.provider, "anthropic");
+        assert_eq!(req.session_id, "s1");
+        assert!(req.api_key.is_none());
+    }
+
+    #[test]
+    fn update_provider_request_deserializes_with_api_key() {
+        let req: UpdateProviderRequest = serde_json::from_str(
+            r#"{"provider":"anthropic","model":"claude-test","session_id":"s1","api_key":"sk-member-123"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.api_key.as_deref(), Some("sk-member-123"));
+        assert!(req.api_host.is_none());
+    }
+
+    #[test]
+    fn update_provider_request_deserializes_with_api_host() {
+        let req: UpdateProviderRequest = serde_json::from_str(
+            r#"{"provider":"openai","model":"gpt-4o","session_id":"s1","api_key":"venice-key","api_host":"https://api.venice.ai/api/v1"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.api_key.as_deref(), Some("venice-key"));
+        assert_eq!(req.api_host.as_deref(), Some("https://api.venice.ai/api/v1"));
+        // Old api-key body carries no oauth fields.
+        assert!(req.auth_token.is_none());
+        assert!(req.credential_kind.is_none());
+    }
+
+    #[test]
+    fn update_provider_request_deserializes_with_oauth_auth_token() {
+        let req: UpdateProviderRequest = serde_json::from_str(
+            r#"{"provider":"anthropic","model":"claude-sonnet-4-5","session_id":"s1","auth_token":"member-oauth-token","credential_kind":"oauth"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.auth_token.as_deref(), Some("member-oauth-token"));
+        assert_eq!(req.credential_kind.as_deref(), Some("oauth"));
+        // OAuth bodies never carry an api_key.
+        assert!(req.api_key.is_none());
+    }
+
+    #[test]
+    fn update_provider_request_credential_kind_defaults_when_absent() {
+        // A pre-OAuth bridge sends neither credential_kind nor auth_token; the
+        // body must still deserialize (deploy-order-safe).
+        let req: UpdateProviderRequest = serde_json::from_str(
+            r#"{"provider":"anthropic","model":"claude-test","session_id":"s1","api_key":"sk-member-123"}"#,
+        )
+        .unwrap();
+        assert!(req.credential_kind.is_none());
+        assert!(req.auth_token.is_none());
+        assert_eq!(req.api_key.as_deref(), Some("sk-member-123"));
+    }
 
     fn frontend_extension() -> ExtensionConfig {
         ExtensionConfig::Frontend {
@@ -1398,15 +1560,11 @@ mod tests {
             .await
             .unwrap();
 
-        agent_add_extension(
-            State(state.clone()),
-            Json(AddExtensionRequest {
-                session_id: session.id.clone(),
-                config: frontend_extension(),
-            }),
-        )
-        .await
-        .unwrap();
+        let agent = state.get_agent(session.id.clone()).await.unwrap();
+        agent
+            .add_extension(frontend_extension(), &session.id)
+            .await
+            .unwrap();
 
         let Json(tools) = get_tools(
             State(state.clone()),

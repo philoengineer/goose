@@ -1,6 +1,3 @@
-#[cfg(not(any(feature = "rustls-tls", feature = "native-tls")))]
-compile_error!("At least one of `rustls-tls` or `native-tls` features must be enabled");
-
 #[cfg(all(feature = "rustls-tls", feature = "native-tls"))]
 compile_error!("Features `rustls-tls` and `native-tls` are mutually exclusive");
 
@@ -9,6 +6,7 @@ pub use goose_sdk::custom_requests;
 pub mod action_required_manager;
 pub mod agents;
 pub mod builtin_extension;
+pub mod checks;
 pub mod config;
 pub mod context_mgmt;
 pub mod conversation;

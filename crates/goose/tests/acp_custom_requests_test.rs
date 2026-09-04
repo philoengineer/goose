@@ -12,6 +12,7 @@ use goose::model::ModelConfig;
 use goose::providers::base::{MessageStream, Provider};
 use goose::providers::errors::ProviderError;
 use goose_test_support::{EnforceSessionId, IgnoreSessionId};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use common_tests::fixtures::OpenAiFixture;
@@ -20,6 +21,7 @@ struct MockProvider {
     name: String,
     model_config: ModelConfig,
     recommended_models: Vec<String>,
+    supported_models: Vec<String>,
 }
 
 #[async_trait::async_trait]
@@ -46,10 +48,14 @@ impl Provider for MockProvider {
     async fn fetch_recommended_models(&self) -> Result<Vec<String>, ProviderError> {
         Ok(self.recommended_models.clone())
     }
+
+    async fn fetch_supported_models(&self) -> Result<Vec<String>, ProviderError> {
+        Ok(self.supported_models.clone())
+    }
 }
 
 fn mock_provider_factory() -> AcpProviderFactory {
-    Arc::new(|provider_name, model_config, _extensions| {
+    Arc::new(|provider_name, model_config, _extensions, _working_dir| {
         Box::pin(async move {
             let recommended_models = match provider_name.as_str() {
                 "anthropic" => vec![
@@ -61,6 +67,7 @@ fn mock_provider_factory() -> AcpProviderFactory {
             Ok(Arc::new(MockProvider {
                 name: provider_name,
                 model_config,
+                supported_models: recommended_models.clone(),
                 recommended_models,
             }) as Arc<dyn Provider>)
         })
@@ -78,7 +85,7 @@ fn test_custom_get_tools() {
 
         let result = send_custom(
             conn.cx(),
-            "_goose/tools",
+            "_goose/unstable/tools/list",
             serde_json::json!({ "sessionId": session_id }),
         )
         .await;
@@ -96,8 +103,12 @@ fn test_custom_get_extensions() {
         let openai = OpenAiFixture::new(vec![], Arc::new(EnforceSessionId::default())).await;
         let conn = AcpServerConnection::new(TestConnectionConfig::default(), openai).await;
 
-        let result =
-            send_custom(conn.cx(), "_goose/config/extensions", serde_json::json!({})).await;
+        let result = send_custom(
+            conn.cx(),
+            "_goose/unstable/config/extensions/list",
+            serde_json::json!({}),
+        )
+        .await;
         assert!(result.is_ok(), "expected ok, got: {:?}", result);
 
         let response = result.unwrap();
@@ -113,6 +124,108 @@ fn test_custom_get_extensions() {
 }
 
 #[test]
+fn test_new_session_passes_cwd_to_provider_factory() {
+    run_test(async move {
+        let openai = OpenAiFixture::new(vec![], Arc::new(EnforceSessionId::default())).await;
+        let cwd = tempfile::tempdir().unwrap();
+        let expected_cwd = cwd.path().to_path_buf();
+        let captured_cwds = Arc::new(Mutex::new(Vec::<Option<PathBuf>>::new()));
+        let factory_cwds = Arc::clone(&captured_cwds);
+        let provider_factory: AcpProviderFactory = Arc::new(
+            move |provider_name, model_config, _extensions, working_dir| {
+                factory_cwds.lock().unwrap().push(working_dir);
+                Box::pin(async move {
+                    Ok(Arc::new(MockProvider {
+                        name: provider_name,
+                        model_config,
+                        recommended_models: Vec::new(),
+                        supported_models: Vec::new(),
+                    }) as Arc<dyn Provider>)
+                })
+            },
+        );
+
+        let mut conn = AcpServerConnection::new(
+            TestConnectionConfig {
+                cwd: Some(cwd),
+                provider_factory: Some(provider_factory),
+                ..Default::default()
+            },
+            openai,
+        )
+        .await;
+
+        conn.new_session().await.unwrap();
+
+        let captured_cwd = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(cwd) = captured_cwds.lock().unwrap().first().cloned() {
+                    break cwd;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("provider factory was not called");
+
+        assert_eq!(captured_cwd, Some(expected_cwd));
+    });
+}
+
+#[test]
+fn test_load_session_passes_load_cwd_to_provider_factory() {
+    run_test(async move {
+        let openai = OpenAiFixture::new(vec![], Arc::new(EnforceSessionId::default())).await;
+        let initial_cwd = tempfile::tempdir().unwrap();
+        let captured_cwds = Arc::new(Mutex::new(Vec::<Option<PathBuf>>::new()));
+        let factory_cwds = Arc::clone(&captured_cwds);
+        let provider_factory: AcpProviderFactory = Arc::new(
+            move |provider_name, model_config, _extensions, working_dir| {
+                factory_cwds.lock().unwrap().push(working_dir);
+                Box::pin(async move {
+                    Ok(Arc::new(MockProvider {
+                        name: provider_name,
+                        model_config,
+                        recommended_models: Vec::new(),
+                        supported_models: Vec::new(),
+                    }) as Arc<dyn Provider>)
+                })
+            },
+        );
+
+        let mut conn = AcpServerConnection::new(
+            TestConnectionConfig {
+                cwd: Some(initial_cwd),
+                provider_factory: Some(provider_factory),
+                ..Default::default()
+            },
+            openai,
+        )
+        .await;
+
+        let SessionData { session, .. } = conn.new_session().await.unwrap();
+        let session_id = session.session_id().0.to_string();
+        let SessionData {
+            session: loaded, ..
+        } = conn.load_session(&session_id, vec![]).await.unwrap();
+        let expected_cwd = loaded.work_dir();
+
+        let captured_cwd = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(cwd) = captured_cwds.lock().unwrap().get(1).cloned() {
+                    break cwd;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("provider factory was not called for load session");
+
+        assert_eq!(captured_cwd, Some(expected_cwd));
+    });
+}
+
+#[test]
 fn test_custom_list_builtin_skill_sources() {
     run_test(async move {
         let openai = OpenAiFixture::new(vec![], Arc::new(EnforceSessionId::default())).await;
@@ -120,7 +233,7 @@ fn test_custom_list_builtin_skill_sources() {
 
         let response = send_custom(
             conn.cx(),
-            "_goose/sources/list",
+            "_goose/unstable/sources/list",
             serde_json::json!({ "type": "builtinSkill" }),
         )
         .await
@@ -152,9 +265,13 @@ fn test_custom_provider_inventory_includes_metadata() {
         let openai = OpenAiFixture::new(vec![], Arc::new(EnforceSessionId::default())).await;
         let conn = AcpServerConnection::new(TestConnectionConfig::default(), openai).await;
 
-        let response = send_custom(conn.cx(), "_goose/providers/list", serde_json::json!({}))
-            .await
-            .expect("provider inventory should succeed");
+        let response = send_custom(
+            conn.cx(),
+            "_goose/unstable/providers/list",
+            serde_json::json!({}),
+        )
+        .await
+        .expect("provider inventory should succeed");
         let providers = response
             .get("entries")
             .and_then(|value| value.as_array())
@@ -193,7 +310,7 @@ fn test_custom_preferences_read_save_remove() {
 
         let response = send_custom(
             conn.cx(),
-            "_goose/preferences/read",
+            "_goose/unstable/preferences/read",
             serde_json::json!({
                 "keys": [
                     "autoCompactThreshold",
@@ -215,7 +332,7 @@ fn test_custom_preferences_read_save_remove() {
 
         send_custom(
             conn.cx(),
-            "_goose/preferences/save",
+            "_goose/unstable/preferences/save",
             serde_json::json!({
                 "values": [
                     { "key": "voiceDictationProvider", "value": "__disabled__" },
@@ -228,7 +345,7 @@ fn test_custom_preferences_read_save_remove() {
 
         send_custom(
             conn.cx(),
-            "_goose/preferences/remove",
+            "_goose/unstable/preferences/remove",
             serde_json::json!({
                 "keys": ["voiceDictationProvider"],
             }),
@@ -238,7 +355,7 @@ fn test_custom_preferences_read_save_remove() {
 
         let response = send_custom(
             conn.cx(),
-            "_goose/preferences/read",
+            "_goose/unstable/preferences/read",
             serde_json::json!({
                 "keys": ["voiceDictationProvider", "voiceDictationPreferredMic"],
             }),
@@ -280,13 +397,13 @@ fn test_custom_preferences_save_rejects_invalid_values() {
         ];
 
         for payload in invalid_payloads {
-            let result = send_custom(conn.cx(), "_goose/preferences/save", payload).await;
+            let result = send_custom(conn.cx(), "_goose/unstable/preferences/save", payload).await;
             assert!(result.is_err(), "expected invalid params error");
         }
 
         let result = send_custom(
             conn.cx(),
-            "_goose/preferences/save",
+            "_goose/unstable/preferences/save",
             serde_json::json!({
                 "values": [
                     { "key": "voiceDictationPreferredMic", "value": "mic-1" },
@@ -299,7 +416,7 @@ fn test_custom_preferences_save_rejects_invalid_values() {
 
         let response = send_custom(
             conn.cx(),
-            "_goose/preferences/read",
+            "_goose/unstable/preferences/read",
             serde_json::json!({
                 "keys": ["voiceDictationPreferredMic"],
             }),
@@ -331,9 +448,13 @@ fn test_custom_defaults_read() {
         };
         let conn = AcpServerConnection::new(config, openai).await;
 
-        let response = send_custom(conn.cx(), "_goose/defaults/read", serde_json::json!({}))
-            .await
-            .expect("defaults read should succeed");
+        let response = send_custom(
+            conn.cx(),
+            "_goose/unstable/defaults/read",
+            serde_json::json!({}),
+        )
+        .await
+        .expect("defaults read should succeed");
         assert_eq!(
             response,
             serde_json::json!({
@@ -371,7 +492,7 @@ fn test_custom_dictation_secret_save_delete() {
 
         send_custom(
             conn.cx(),
-            "_goose/dictation/secret/save",
+            "_goose/unstable/dictation/secret/save",
             serde_json::json!({
                 "provider": "groq",
                 "value": "groq-key",
@@ -380,9 +501,13 @@ fn test_custom_dictation_secret_save_delete() {
         .await
         .expect("dictation secret save should succeed");
 
-        let config = send_custom(conn.cx(), "_goose/dictation/config", serde_json::json!({}))
-            .await
-            .expect("dictation config should succeed");
+        let config = send_custom(
+            conn.cx(),
+            "_goose/unstable/dictation/config",
+            serde_json::json!({}),
+        )
+        .await
+        .expect("dictation config should succeed");
         assert_eq!(
             config
                 .pointer("/providers/groq/configured")
@@ -392,7 +517,7 @@ fn test_custom_dictation_secret_save_delete() {
 
         let provider_config_result = send_custom(
             conn.cx(),
-            "_goose/dictation/secret/save",
+            "_goose/unstable/dictation/secret/save",
             serde_json::json!({
                 "provider": "openai",
                 "value": "openai-key",
@@ -406,7 +531,7 @@ fn test_custom_dictation_secret_save_delete() {
 
         let unknown_result = send_custom(
             conn.cx(),
-            "_goose/dictation/secret/save",
+            "_goose/unstable/dictation/secret/save",
             serde_json::json!({
                 "provider": "unknown",
                 "value": "key",
@@ -420,7 +545,7 @@ fn test_custom_dictation_secret_save_delete() {
 
         send_custom(
             conn.cx(),
-            "_goose/dictation/secret/delete",
+            "_goose/unstable/dictation/secret/delete",
             serde_json::json!({
                 "provider": "groq",
             }),
@@ -428,9 +553,13 @@ fn test_custom_dictation_secret_save_delete() {
         .await
         .expect("dictation secret delete should succeed");
 
-        let config = send_custom(conn.cx(), "_goose/dictation/config", serde_json::json!({}))
-            .await
-            .expect("dictation config should succeed");
+        let config = send_custom(
+            conn.cx(),
+            "_goose/unstable/dictation/config",
+            serde_json::json!({}),
+        )
+        .await
+        .expect("dictation config should succeed");
         assert_eq!(
             config
                 .pointer("/providers/groq/configured")
@@ -549,6 +678,55 @@ fn test_developer_fs_requests_use_acp_session_id() {
             seen_session_id.lock().unwrap().as_deref(),
             Some(acp_session_id.as_str()),
             "ACP read request should use the ACP session/thread ID",
+        );
+    });
+}
+
+#[test]
+fn test_custom_provider_supported_models_lists_raw_provider_models() {
+    run_test(async move {
+        let openai = OpenAiFixture::new(vec![], Arc::new(EnforceSessionId::default())).await;
+        let provider_factory: AcpProviderFactory =
+            Arc::new(|provider_name, model_config, _extensions, _working_dir| {
+                Box::pin(async move {
+                    Ok(Arc::new(MockProvider {
+                        name: provider_name,
+                        model_config,
+                        recommended_models: vec!["canonical-filtered-model".to_string()],
+                        supported_models: vec![
+                            "goose-claude-opus-4-8".to_string(),
+                            "raw-databricks-endpoint".to_string(),
+                        ],
+                    }) as Arc<dyn Provider>)
+                })
+            });
+        let conn = AcpServerConnection::new(
+            TestConnectionConfig {
+                provider_factory: Some(provider_factory),
+                ..Default::default()
+            },
+            openai,
+        )
+        .await;
+
+        let response = send_custom(
+            conn.cx(),
+            "_goose/unstable/providers/supported-models/list",
+            serde_json::json!({ "providerId": "openai" }),
+        )
+        .await
+        .expect("provider supported models list should succeed");
+
+        assert_eq!(
+            response.get("providerId"),
+            Some(&serde_json::json!("openai"))
+        );
+        assert_eq!(
+            response.get("models"),
+            Some(&serde_json::json!([
+                "goose-claude-opus-4-8",
+                "raw-databricks-endpoint"
+            ]))
         );
     });
 }

@@ -12,7 +12,8 @@ use super::api_client::{ApiClient, AuthMethod};
 use super::base::{ConfigKey, MessageStream, ModelInfo, Provider, ProviderDef, ProviderMetadata};
 use super::errors::ProviderError;
 use super::formats::anthropic::{
-    create_request, response_to_streaming_message, thinking_type, ThinkingType,
+    create_request_with_options, response_to_streaming_message, thinking_type,
+    AnthropicFormatOptions, ThinkingType,
 };
 use super::inventory::{config_secret_value, serialize_string_map, InventoryIdentityInput};
 use super::openai_compatible::handle_status;
@@ -59,6 +60,8 @@ pub struct AnthropicProvider {
     custom_models: Option<Vec<String>>,
     dynamic_models: Option<bool>,
     skip_canonical_filtering: bool,
+    #[serde(skip)]
+    format_options: AnthropicFormatOptions,
 }
 
 impl AnthropicProvider {
@@ -87,6 +90,46 @@ impl AnthropicProvider {
             custom_models: None,
             dynamic_models: None,
             skip_canonical_filtering: false,
+            format_options: AnthropicFormatOptions::default(),
+        })
+    }
+
+    /// Build a provider authenticated with an explicitly supplied API key
+    /// (per-run member credential) instead of the stored `ANTHROPIC_API_KEY`
+    /// secret. Mirrors `from_env` minus the secret lookup, so it works even
+    /// when no process-wide key is configured. The key is only held in the
+    /// constructed client and is never persisted.
+    pub fn from_key(model: ModelConfig, api_key: String) -> Result<Self> {
+        if api_key.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "Explicit Anthropic API key must not be empty"
+            ));
+        }
+
+        let model = model.with_fast(ANTHROPIC_DEFAULT_FAST_MODEL, ANTHROPIC_PROVIDER_NAME)?;
+
+        let config = crate::config::Config::global();
+        let host: String = config
+            .get_param("ANTHROPIC_HOST")
+            .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+
+        let auth = AuthMethod::ApiKey {
+            header_name: "x-api-key".to_string(),
+            key: api_key,
+        };
+
+        let api_client =
+            ApiClient::new(host, auth)?.with_header("anthropic-version", ANTHROPIC_API_VERSION)?;
+
+        Ok(Self {
+            api_client,
+            model,
+            supports_streaming: true,
+            name: ANTHROPIC_PROVIDER_NAME.to_string(),
+            custom_models: None,
+            dynamic_models: None,
+            skip_canonical_filtering: false,
+            format_options: AnthropicFormatOptions::default(),
         })
     }
 
@@ -124,6 +167,8 @@ impl AnthropicProvider {
             key: api_key,
         };
 
+        let format_options = Self::format_options_for_provider(config.preserves_thinking);
+
         let mut api_client = ApiClient::new(config.base_url, auth)?
             .with_header("anthropic-version", ANTHROPIC_API_VERSION)?;
 
@@ -160,7 +205,15 @@ impl AnthropicProvider {
             custom_models,
             dynamic_models: config.dynamic_models,
             skip_canonical_filtering: config.skip_canonical_filtering,
+            format_options,
         })
+    }
+
+    fn format_options_for_provider(preserves_thinking: bool) -> AnthropicFormatOptions {
+        AnthropicFormatOptions {
+            preserve_unsigned_thinking: preserves_thinking,
+            preserve_thinking_context: preserves_thinking,
+        }
     }
 
     fn get_conditional_headers(&self) -> Vec<(&str, &str)> {
@@ -194,6 +247,7 @@ impl AnthropicProvider {
             return Err(map_http_error_to_provider_error(
                 response.status,
                 response.payload,
+                "v1/models",
             ));
         }
 
@@ -326,7 +380,13 @@ impl Provider for AnthropicProvider {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
-        let mut payload = create_request(model_config, system, messages, tools)?;
+        let mut payload = create_request_with_options(
+            model_config,
+            system,
+            messages,
+            tools,
+            self.format_options,
+        )?;
         payload
             .as_object_mut()
             .unwrap()
@@ -365,7 +425,6 @@ impl Provider for AnthropicProvider {
         }))
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +453,7 @@ mod tests {
             custom_models,
             dynamic_models,
             skip_canonical_filtering: false,
+            format_options: AnthropicFormatOptions::default(),
         }
     }
 
@@ -421,7 +481,38 @@ mod tests {
             model_doc_link: None,
             setup_steps: vec![],
             fast_model: None,
+            preserves_thinking: false,
         }
+    }
+
+    #[test]
+    fn from_key_builds_provider_with_supplied_key() {
+        let provider = AnthropicProvider::from_key(
+            ModelConfig::new_or_fail("claude-test"),
+            "member-supplied-key".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(provider.name, ANTHROPIC_PROVIDER_NAME);
+        match provider.api_client.auth() {
+            AuthMethod::ApiKey { header_name, key } => {
+                assert_eq!(header_name, "x-api-key");
+                assert_eq!(key, "member-supplied-key");
+            }
+            _ => panic!("expected AuthMethod::ApiKey carrying the supplied key"),
+        }
+    }
+
+    #[test]
+    fn from_key_rejects_empty_key() {
+        let err = match AnthropicProvider::from_key(
+            ModelConfig::new_or_fail("claude-test"),
+            "   ".to_string(),
+        ) {
+            Ok(_) => panic!("empty explicit key must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("must not be empty"));
     }
 
     #[tokio::test]
